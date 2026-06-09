@@ -5,6 +5,7 @@ import sys
 import ctypes
 import io
 import time
+import threading
 from pathlib import Path
 
 import pygame
@@ -16,6 +17,10 @@ BG = (18, 18, 18)
 PANEL = (28, 28, 28)
 TEXT = (235, 235, 235)
 ACCENT = (255, 255, 255)
+CHECKER_LIGHT = (178, 178, 178)
+CHECKER_DARK = (112, 112, 112)
+CHECKER_SIZE = 16
+PREVIEW_BACKGROUNDS = ("Checker", "Black", "White")
 
 WINDOW_W = 1400
 WINDOW_H = 900
@@ -65,6 +70,12 @@ if IS_WINDOWS:
     user32.SetClipboardData.restype = ctypes.c_void_p
     user32.GetClipboardData.argtypes = [ctypes.c_uint]
     user32.GetClipboardData.restype = ctypes.c_void_p
+    user32.RegisterClipboardFormatW.argtypes = [ctypes.c_wchar_p]
+    user32.RegisterClipboardFormatW.restype = ctypes.c_uint
+    user32.IsClipboardFormatAvailable.argtypes = [ctypes.c_uint]
+    user32.IsClipboardFormatAvailable.restype = ctypes.c_int
+    kernel32.GlobalSize.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalSize.restype = ctypes.c_size_t
 
     kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
     kernel32.GlobalAlloc.restype = ctypes.c_void_p
@@ -128,7 +139,57 @@ def set_image_clipboard_from_path(path):
         return False
 
 
+def set_png_clipboard_from_path(path):
+    if not IS_WINDOWS:
+        return False
+
+    try:
+        png_format = user32.RegisterClipboardFormatW("PNG")
+        if not png_format:
+            return False
+
+        image = Image.open(path).convert("RGBA")
+        output = io.BytesIO()
+        image.save(output, format="PNG")
+        data = output.getvalue()
+        output.close()
+
+        hglobal = kernel32.GlobalAlloc(GHND, len(data))
+        if not hglobal:
+            return False
+
+        ptr = kernel32.GlobalLock(hglobal)
+        if not ptr:
+            kernel32.GlobalFree(hglobal)
+            return False
+
+        ctypes.memmove(ptr, data, len(data))
+        kernel32.GlobalUnlock(hglobal)
+
+        if not user32.OpenClipboard(None):
+            kernel32.GlobalFree(hglobal)
+            return False
+
+        try:
+            user32.EmptyClipboard()
+            if not user32.SetClipboardData(png_format, hglobal):
+                kernel32.GlobalFree(hglobal)
+                return False
+            hglobal = None
+            return True
+        finally:
+            user32.CloseClipboard()
+            if hglobal:
+                kernel32.GlobalFree(hglobal)
+    except Exception:
+        return False
+
+
 def get_image_from_clipboard():
+    png_image = get_png_image_from_clipboard()
+    if png_image is not None:
+        return png_image
+
     try:
         data = ImageGrab.grabclipboard()
         if isinstance(data, Image.Image):
@@ -136,6 +197,37 @@ def get_image_from_clipboard():
     except Exception:
         pass
     return None
+
+
+def get_png_image_from_clipboard():
+    if not IS_WINDOWS:
+        return None
+
+    try:
+        png_format = user32.RegisterClipboardFormatW("PNG")
+        if not png_format or not user32.IsClipboardFormatAvailable(png_format):
+            return None
+        if not user32.OpenClipboard(None):
+            return None
+
+        try:
+            handle = user32.GetClipboardData(png_format)
+            if not handle:
+                return None
+            size = kernel32.GlobalSize(handle)
+            ptr = kernel32.GlobalLock(handle)
+            if not ptr or not size:
+                return None
+            try:
+                data = ctypes.string_at(ptr, size)
+            finally:
+                kernel32.GlobalUnlock(handle)
+        finally:
+            user32.CloseClipboard()
+
+        return Image.open(io.BytesIO(data)).convert("RGBA")
+    except Exception:
+        return None
 
 
 def set_file_clipboard(paths):
@@ -264,6 +356,26 @@ class FrameEditorApp:
         self.color_reference_label = ""
         self.color_wheel_photo = None
         self.color_match_method = "HM"
+        self.mask_edit_mode = False
+        self.mask_paint_mode = "restore"
+        self.mask_brush_size = 12
+        self.mask_dragging = False
+        self.wand_mode = False
+        self.wand_selection = None
+        self.wand_tolerance = 32
+        self.wand_dragging = False
+        self.wand_start_pos = None
+        self.wand_start_tolerance = 32
+        self.wand_combine_mode = "replace"
+        self.wand_drag_base = None
+        self.wand_last_drag_tolerance = None
+        self.wand_zone_cache = {}
+        self.wand_zone_lock = threading.Lock()
+        self.wand_preload_thread = None
+        self.wand_preload_targets = []
+        self.wand_preload_running = False
+        self.preview_background = "Checker"
+        self.background_toggle_rect = pygame.Rect(0, 0, 120, 34)
 
         self.tk_root = Tk()
         self.tk_root.withdraw()
@@ -348,6 +460,7 @@ class FrameEditorApp:
         self.prime_caches_near_current()
         self.rebuild_timeline_metrics()
         self.center_selected()
+        self.schedule_wand_zone_preload()
         self.loading_message = ""
         self.set_status(f"Opened {path.name}")
 
@@ -612,12 +725,48 @@ class FrameEditorApp:
             shutil.copy(temp_video, save_path)
             self.set_status("Exported video only")
 
+    def export_high_quality_gif(self):
+        if not self.frames:
+            return
+        save_path = filedialog.asksaveasfilename(
+            title="Save high quality GIF",
+            defaultextension=".gif",
+            filetypes=[("GIF Animation", "*.gif")],
+        )
+        if not save_path:
+            return
+
+        width, height, output_fps = self.get_retarget_settings()
+        filter_graph = (
+            f"fps={output_fps},scale={width}:{height}:flags=lanczos,"
+            "split[s0][s1];"
+            "[s0]palettegen=max_colors=256:reserve_transparent=1[p];"
+            "[s1][p]paletteuse=dither=sierra2_4a:alpha_threshold=128"
+        )
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-framerate",
+                str(output_fps),
+                "-i",
+                str(TEMP_DIR / "frame_%06d.png"),
+                "-filter_complex",
+                filter_graph,
+                "-loop",
+                "0",
+                save_path,
+            ],
+            check=True,
+        )
+        self.set_status("Exported high quality GIF")
+
     # ---------- cache ----------
     def load_full_surface(self, index):
         surf = self.full_cache.get(index)
         if surf is not None:
             return surf
-        surf = pygame.image.load(str(self.frame_paths[index])).convert()
+        surf = pygame.image.load(str(self.frame_paths[index])).convert_alpha()
         self.full_cache[index] = surf
         return surf
 
@@ -631,8 +780,11 @@ class FrameEditorApp:
         scale = target_h / full.get_height()
         size = (max(1, int(full.get_width() * scale)), max(1, target_h))
         thumb = pygame.transform.smoothscale(full, size)
-        cache[index] = thumb
-        return thumb
+        composed = pygame.Surface(size).convert()
+        self.draw_alpha_background(composed, composed.get_rect())
+        composed.blit(thumb, (0, 0))
+        cache[index] = composed
+        return composed
 
     def prime_caches_near_current(self):
         if not self.frames:
@@ -768,12 +920,15 @@ class FrameEditorApp:
         if index == self.current_index:
             return
         self.current_index = index
+        self.wand_selection = None
+        self.wand_dragging = False
         self.preview_surface = None
         self.preview_surface_key = None
         self.needs_preview_refresh = True
         self.clamp_preview_offset()
         self.prime_caches_near_current()
         self.center_selected()
+        self.schedule_wand_zone_preload()
 
     def refresh_preview_surface(self):
         if not self.frames:
@@ -781,7 +936,7 @@ class FrameEditorApp:
 
         rect = self.get_preview_rect()
         full = self.load_full_surface(self.current_index)
-        key = (self.current_index, rect.size, round(self.preview_zoom, 4), int(self.preview_offset[0]), int(self.preview_offset[1]))
+        key = (self.current_index, rect.size, round(self.preview_zoom, 4), int(self.preview_offset[0]), int(self.preview_offset[1]), self.preview_background)
         if key == self.preview_surface_key and self.preview_surface is not None:
             return
 
@@ -792,8 +947,8 @@ class FrameEditorApp:
         draw_h = max(1, int(img_h * scale))
         scaled = pygame.transform.smoothscale(full, (draw_w, draw_h))
 
-        surface = pygame.Surface((rect.w, rect.h))
-        surface.fill((0, 0, 0))
+        surface = pygame.Surface((rect.w, rect.h)).convert()
+        self.draw_alpha_background(surface, surface.get_rect(), offset=(-int(self.preview_offset[0]), -int(self.preview_offset[1])))
         x = (rect.w - draw_w) // 2 + int(self.preview_offset[0])
         y = (rect.h - draw_h) // 2 + int(self.preview_offset[1])
         surface.blit(scaled, (x, y))
@@ -826,17 +981,54 @@ class FrameEditorApp:
             self.full_cache.clear()
             self.thumb_cache.clear()
             self.large_thumb_cache.clear()
+            with self.wand_zone_lock:
+                self.wand_zone_cache.clear()
         else:
             for cache in (self.full_cache, self.thumb_cache, self.large_thumb_cache):
                 cache.pop(index, None)
+            with self.wand_zone_lock:
+                self.wand_zone_cache.pop(index, None)
 
         self.preview_surface = None
         self.preview_surface_key = None
         self.needs_preview_refresh = True
 
     def save_edited_frame(self, index, image):
-        image.convert("RGB").save(self.frame_paths[index])
+        image.convert("RGBA").save(self.frame_paths[index])
         self.invalidate_frame_cache(index)
+        if index == self.current_index:
+            self.schedule_wand_zone_preload()
+
+    def draw_checkerboard(self, surface, rect, offset=(0, 0)):
+        clip = surface.get_clip()
+        surface.set_clip(rect)
+        start_x = rect.x - ((rect.x + offset[0]) % CHECKER_SIZE)
+        start_y = rect.y - ((rect.y + offset[1]) % CHECKER_SIZE)
+        for y in range(start_y, rect.bottom, CHECKER_SIZE):
+            for x in range(start_x, rect.right, CHECKER_SIZE):
+                tile_x = (x + offset[0]) // CHECKER_SIZE
+                tile_y = (y + offset[1]) // CHECKER_SIZE
+                color = CHECKER_LIGHT if (tile_x + tile_y) % 2 == 0 else CHECKER_DARK
+                pygame.draw.rect(surface, color, (x, y, CHECKER_SIZE, CHECKER_SIZE))
+        surface.set_clip(clip)
+
+    def draw_alpha_background(self, surface, rect, offset=(0, 0)):
+        if self.preview_background == "Black":
+            surface.fill((0, 0, 0), rect)
+        elif self.preview_background == "White":
+            surface.fill((255, 255, 255), rect)
+        else:
+            self.draw_checkerboard(surface, rect, offset)
+
+    def cycle_preview_background(self):
+        index = PREVIEW_BACKGROUNDS.index(self.preview_background)
+        self.preview_background = PREVIEW_BACKGROUNDS[(index + 1) % len(PREVIEW_BACKGROUNDS)]
+        self.thumb_cache.clear()
+        self.large_thumb_cache.clear()
+        self.preview_surface = None
+        self.preview_surface_key = None
+        self.needs_preview_refresh = True
+        self.set_status(f"Background: {self.preview_background}")
 
     # ---------- color ----------
     def apply_hue_saturation_to_image(self, image, hue_degrees, saturation_percent):
@@ -1052,7 +1244,7 @@ class FrameEditorApp:
                     continue
                 with Image.open(path) as image:
                     matched = self.apply_color_match_method(image, reference)
-                matched.convert("RGB").save(path)
+                matched.convert("RGBA").save(path)
         except RuntimeError as exc:
             self.loading_message = ""
             self.set_status(str(exc))
@@ -1188,18 +1380,431 @@ class FrameEditorApp:
         popup.bind("<Escape>", lambda _event: close_popup())
         update_color_preview()
 
+    # ---------- background / mask ----------
+    def toggle_mask_edit_mode(self):
+        self.mask_edit_mode = not self.mask_edit_mode
+        self.mask_dragging = False
+        state = "on" if self.mask_edit_mode else "off"
+        self.set_status(f"Mask edit {state}")
+
+    def set_mask_restore_mode(self):
+        self.mask_paint_mode = "restore"
+        self.set_status("Mask brush restores image")
+
+    def set_mask_erase_mode(self):
+        self.mask_paint_mode = "erase"
+        self.set_status("Mask brush erases image")
+
+    def toggle_wand_mode(self):
+        self.wand_mode = not self.wand_mode
+        self.wand_dragging = False
+        state = "on" if self.wand_mode else "off"
+        if self.wand_mode and self.frames:
+            try:
+                self.get_wand_zone_cache(self.current_index)
+            except RuntimeError as exc:
+                self.set_status(str(exc))
+                self.wand_mode = False
+                self.loading_message = ""
+                return
+        self.set_status(f"Wand select {state}")
+
+    def clear_wand_selection(self):
+        self.wand_selection = None
+        self.wand_dragging = False
+        self.set_status("Selection cleared")
+
+    def adjust_mask_brush_size(self, delta):
+        sizes = list(range(1, 11)) + [12, 15, 20, 25, 32, 40, 50, 64, 80, 100, 128, 160, 200]
+        current = min(range(len(sizes)), key=lambda i: abs(sizes[i] - self.mask_brush_size))
+        current = max(0, min(len(sizes) - 1, current + delta))
+        self.mask_brush_size = sizes[current]
+        self.set_status(f"Mask brush {self.mask_brush_size}px")
+
+    def preview_to_image_pos(self, mouse):
+        if not self.frames:
+            return None
+
+        rect = self.get_preview_rect()
+        if not rect.collidepoint(mouse):
+            return None
+
+        full = self.load_full_surface(self.current_index)
+        img_w, img_h = full.get_size()
+        fit_scale = min(rect.w / img_w, rect.h / img_h)
+        scale = max(0.05, fit_scale * self.preview_zoom)
+        draw_w = max(1, int(img_w * scale))
+        draw_h = max(1, int(img_h * scale))
+        draw_x = rect.x + (rect.w - draw_w) // 2 + int(self.preview_offset[0])
+        draw_y = rect.y + (rect.h - draw_h) // 2 + int(self.preview_offset[1])
+
+        x = int((mouse[0] - draw_x) / scale)
+        y = int((mouse[1] - draw_y) / scale)
+        if x < 0 or y < 0 or x >= img_w or y >= img_h:
+            return None
+        return x, y
+
+    def paint_mask_at(self, mouse):
+        pos = self.preview_to_image_pos(mouse)
+        if pos is None:
+            return
+
+        x, y = pos
+        image = Image.open(self.frame_paths[self.current_index]).convert("RGBA")
+        alpha = image.getchannel("A")
+        try:
+            from PIL import ImageDraw
+            draw = ImageDraw.Draw(alpha)
+            r = self.mask_brush_size
+            fill = 255 if self.mask_paint_mode == "restore" else 0
+            draw.ellipse((x - r, y - r, x + r, y + r), fill=fill)
+            image.putalpha(alpha)
+            self.save_edited_frame(self.current_index, image)
+        finally:
+            image.close()
+
+    def get_wand_zone_cache(self, index):
+        with self.wand_zone_lock:
+            cached = self.wand_zone_cache.get(index)
+        if cached is not None:
+            return cached
+
+        self.loading_message = "Preparing wand zones..."
+        self.force_redraw()
+        try:
+            return self.build_wand_zone_cache(index)
+        finally:
+            self.loading_message = ""
+
+    def build_wand_zone_cache(self, index):
+        with self.wand_zone_lock:
+            cached = self.wand_zone_cache.get(index)
+        if cached is not None:
+            return cached
+
+        try:
+            import numpy as np
+        except ImportError:
+            raise RuntimeError("Install numpy to use wand selection")
+
+        with Image.open(self.frame_paths[index]) as image:
+            rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+
+        labels, component_colors = self.build_wand_components(rgb, np)
+        component_id = len(component_colors)
+        adjacency = [set() for _ in range(component_id)]
+        horizontal_a = labels[:, :-1]
+        horizontal_b = labels[:, 1:]
+        vertical_a = labels[:-1, :]
+        vertical_b = labels[1:, :]
+        for a, b in zip(horizontal_a[horizontal_a != horizontal_b], horizontal_b[horizontal_a != horizontal_b]):
+            adjacency[int(a)].add(int(b))
+            adjacency[int(b)].add(int(a))
+        for a, b in zip(vertical_a[vertical_a != vertical_b], vertical_b[vertical_a != vertical_b]):
+            adjacency[int(a)].add(int(b))
+            adjacency[int(b)].add(int(a))
+
+        cached = {
+            "labels": labels,
+            "colors": np.asarray(component_colors, dtype=np.float32),
+            "adjacency": [tuple(item) for item in adjacency],
+        }
+        with self.wand_zone_lock:
+            self.wand_zone_cache[index] = cached
+        return cached
+
+    def build_wand_components(self, rgb, np):
+        try:
+            from skimage.measure import label
+        except ImportError:
+            return self.build_wand_components_python(rgb, np)
+
+        quantized = (rgb // 16).astype(np.uint16)
+        color_key = (
+            (quantized[..., 0] << 8)
+            | (quantized[..., 1] << 4)
+            | quantized[..., 2]
+        )
+        labels = label(color_key, background=-1, connectivity=1).astype(np.int32) - 1
+        component_count = int(labels.max()) + 1
+        flat_labels = labels.ravel()
+        flat_rgb = rgb.reshape(-1, 3).astype(np.float64)
+        counts = np.bincount(flat_labels, minlength=component_count)
+        component_colors = []
+        for channel in range(3):
+            sums = np.bincount(flat_labels, weights=flat_rgb[:, channel], minlength=component_count)
+            component_colors.append(sums / np.maximum(counts, 1))
+        component_colors = np.stack(component_colors, axis=1)
+        return labels, component_colors
+
+    def build_wand_components_python(self, rgb, np):
+        h, w = rgb.shape[:2]
+        quantized = (rgb // 16).astype(np.uint16)
+        color_key = (
+            (quantized[..., 0] << 8)
+            | (quantized[..., 1] << 4)
+            | quantized[..., 2]
+        )
+        labels = np.full((h, w), -1, dtype=np.int32)
+        component_colors = []
+        component_counts = []
+        stack = []
+        component_id = 0
+
+        for y in range(h):
+            for x in range(w):
+                if labels[y, x] != -1:
+                    continue
+                key = color_key[y, x]
+                labels[y, x] = component_id
+                stack.append((x, y))
+                total = np.zeros(3, dtype=np.float64)
+                count = 0
+
+                while stack:
+                    px, py = stack.pop()
+                    total += rgb[py, px]
+                    count += 1
+                    nx = px + 1
+                    if nx < w and labels[py, nx] == -1 and color_key[py, nx] == key:
+                        labels[py, nx] = component_id
+                        stack.append((nx, py))
+                    nx = px - 1
+                    if nx >= 0 and labels[py, nx] == -1 and color_key[py, nx] == key:
+                        labels[py, nx] = component_id
+                        stack.append((nx, py))
+                    ny = py + 1
+                    if ny < h and labels[ny, px] == -1 and color_key[ny, px] == key:
+                        labels[ny, px] = component_id
+                        stack.append((px, ny))
+                    ny = py - 1
+                    if ny >= 0 and labels[ny, px] == -1 and color_key[ny, px] == key:
+                        labels[ny, px] = component_id
+                        stack.append((px, ny))
+
+                component_colors.append(total / max(1, count))
+                component_counts.append(count)
+                component_id += 1
+        return labels, component_colors
+
+    def get_wand_preload_indexes(self):
+        if not self.frames:
+            return []
+        indexes = [self.current_index]
+        for offset in range(1, 4):
+            left = self.current_index - offset
+            right = self.current_index + offset
+            if right < len(self.frames):
+                indexes.append(right)
+            if left >= 0:
+                indexes.append(left)
+        return indexes
+
+    def schedule_wand_zone_preload(self):
+        if not self.frames:
+            return
+        with self.wand_zone_lock:
+            self.wand_preload_targets = self.get_wand_preload_indexes()
+            if self.wand_preload_running:
+                return
+            self.wand_preload_running = True
+
+        self.wand_preload_thread = threading.Thread(target=self.wand_zone_preload_worker, daemon=True)
+        self.wand_preload_thread.start()
+
+    def wand_zone_preload_worker(self):
+        while True:
+            with self.wand_zone_lock:
+                while self.wand_preload_targets:
+                    index = self.wand_preload_targets.pop(0)
+                    if index not in self.wand_zone_cache:
+                        break
+                else:
+                    self.wand_preload_running = False
+                    return
+
+            try:
+                if 0 <= index < len(self.frame_paths):
+                    self.build_wand_zone_cache(index)
+            except Exception:
+                pass
+
+    def build_wand_region(self, image_pos, tolerance):
+        try:
+            import numpy as np
+        except ImportError:
+            raise RuntimeError("Install numpy to use wand selection")
+
+        cache = self.get_wand_zone_cache(self.current_index)
+        labels = cache["labels"]
+        colors = cache["colors"]
+        adjacency = cache["adjacency"]
+        h, w = labels.shape
+        start_x, start_y = image_pos
+        if start_x < 0 or start_y < 0 or start_x >= w or start_y >= h:
+            return None
+
+        start_label = int(labels[start_y, start_x])
+        target = colors[start_label]
+        selected_components = set()
+        visited = set()
+        stack = [start_label]
+        max_distance = float(tolerance)
+
+        while stack:
+            component = stack.pop()
+            if component in visited:
+                continue
+            visited.add(component)
+            distance = float(np.linalg.norm(colors[component] - target))
+            if distance > max_distance:
+                continue
+            selected_components.add(component)
+            stack.extend(adjacency[component])
+
+        if not selected_components:
+            return None
+        return np.isin(labels, list(selected_components))
+
+    def update_wand_selection(self, image_pos, combine_mode, tolerance):
+        try:
+            region = self.build_wand_region(image_pos, tolerance)
+        except RuntimeError as exc:
+            self.set_status(str(exc))
+            return
+        if region is None:
+            return
+
+        base = self.wand_drag_base if self.wand_drag_base is not None else self.wand_selection
+        if combine_mode == "add" and base is not None:
+            self.wand_selection = base | region
+        elif combine_mode == "subtract" and base is not None:
+            self.wand_selection = base & ~region
+        else:
+            self.wand_selection = region
+        self.set_status(f"Wand tolerance {self.wand_tolerance}")
+
+    def apply_wand_selection_to_alpha(self, alpha_value):
+        if not self.frames or self.wand_selection is None:
+            self.set_status("No wand selection")
+            return
+
+        try:
+            import numpy as np
+        except ImportError:
+            self.set_status("Install numpy to use wand selection")
+            return
+
+        image = Image.open(self.frame_paths[self.current_index]).convert("RGBA")
+        try:
+            alpha = np.asarray(image.getchannel("A"), dtype=np.uint8).copy()
+            if alpha.shape != self.wand_selection.shape:
+                self.set_status("Selection size does not match frame")
+                return
+            alpha[self.wand_selection] = alpha_value
+            image.putalpha(Image.fromarray(alpha, "L"))
+            self.save_edited_frame(self.current_index, image)
+            self.prime_caches_near_current()
+            self.rebuild_timeline_metrics()
+            verb = "Restored" if alpha_value else "Erased"
+            self.set_status(f"{verb} selected area")
+        finally:
+            image.close()
+
+    def clear_current_mask(self):
+        if not self.frames:
+            return
+        image = Image.open(self.frame_paths[self.current_index]).convert("RGBA")
+        try:
+            image.putalpha(0)
+            self.save_edited_frame(self.current_index, image)
+            self.set_status("Erased current frame mask")
+        finally:
+            image.close()
+
+    def fill_current_mask(self):
+        if not self.frames:
+            return
+        image = Image.open(self.frame_paths[self.current_index]).convert("RGBA")
+        try:
+            image.putalpha(255)
+            self.save_edited_frame(self.current_index, image)
+            self.set_status("Filled current frame mask")
+        finally:
+            image.close()
+
+    def remove_background_from_frame(self, index):
+        try:
+            from rembg import remove
+        except ImportError:
+            raise RuntimeError("Install rembg to use background removal")
+
+        with Image.open(self.frame_paths[index]) as image:
+            original = image.convert("RGBA")
+            result = remove(original)
+        if isinstance(result, Image.Image):
+            removed = result.convert("RGBA")
+        else:
+            removed = Image.open(io.BytesIO(result)).convert("RGBA")
+
+        original.putalpha(removed.getchannel("A"))
+        original.save(self.frame_paths[index])
+
+    def remove_background_current_frame(self):
+        if not self.frames:
+            return
+        self.loading_message = "Removing background... please wait"
+        self.set_status("Removing background; this can take a while", 5000)
+        self.force_redraw()
+        try:
+            self.remove_background_from_frame(self.current_index)
+        except Exception as exc:
+            self.loading_message = ""
+            self.set_status(str(exc))
+            return
+        self.loading_message = ""
+        self.invalidate_frame_cache(self.current_index)
+        self.prime_caches_near_current()
+        self.rebuild_timeline_metrics()
+        self.set_status("Removed background; enable Mask Edit to restore areas", 4000)
+
+    def remove_background_whole_video(self):
+        if not self.frames:
+            return
+        self.loading_message = "Removing backgrounds... please wait"
+        self.set_status("Removing backgrounds; this can take a while", 5000)
+        self.force_redraw()
+        try:
+            for i in range(len(self.frames)):
+                self.loading_message = f"Removing backgrounds... {i + 1}/{len(self.frames)}"
+                self.force_redraw()
+                self.remove_background_from_frame(i)
+        except Exception as exc:
+            self.loading_message = ""
+            self.set_status(str(exc))
+            return
+        self.loading_message = ""
+        self.invalidate_frame_cache()
+        self.prime_caches_near_current()
+        self.rebuild_timeline_metrics()
+        self.set_status("Removed backgrounds; enable Mask Edit to restore areas", 4000)
+
     # ---------- copy / paste ----------
     def copy_frame(self):
         if not self.frames:
             return
 
         src = self.frame_paths[self.current_index]
-        shutil.copy(src, "copied_frame.png")
+        copied = Path("copied_frame.png")
+        with Image.open(src) as image:
+            image.convert("RGBA").save(copied)
 
-        if set_image_clipboard_from_path(src):
-            self.set_status("Copied image bitmap to clipboard")
-        elif set_file_clipboard([src]):
-            self.set_status("Copied file path to clipboard")
+        if set_png_clipboard_from_path(copied):
+            self.set_status("Copied alpha image to clipboard")
+        elif set_file_clipboard([copied]):
+            self.set_status("Copied alpha PNG file to clipboard")
+        elif set_image_clipboard_from_path(copied):
+            self.set_status("Copied image bitmap to clipboard; alpha may be flattened")
         else:
             self.set_status("Clipboard copy failed")
 
@@ -1208,10 +1813,20 @@ class FrameEditorApp:
             return
 
         dst = self.frame_paths[self.current_index]
+        current_alpha = None
+        if dst.exists():
+            with Image.open(dst) as current:
+                current_alpha = current.convert("RGBA").getchannel("A")
 
         clipboard_image = get_image_from_clipboard()
         if clipboard_image is not None:
-            clipboard_image.convert("RGB").save(dst)
+            pasted = clipboard_image.convert("RGBA")
+            has_pasted_alpha = "A" in clipboard_image.getbands()
+            if current_alpha is not None and not has_pasted_alpha:
+                if pasted.size != current_alpha.size:
+                    pasted = pasted.resize(current_alpha.size, Image.Resampling.LANCZOS)
+                pasted.putalpha(current_alpha)
+            pasted.save(dst)
         else:
             src = None
             clipboard_paths = [Path(p) for p in get_file_clipboard_paths()]
@@ -1228,14 +1843,16 @@ class FrameEditorApp:
             if src is None:
                 return
 
-            shutil.copy(src, dst)
+            with Image.open(src) as image:
+                pasted = image.convert("RGBA")
+                has_pasted_alpha = "A" in image.getbands()
+                if current_alpha is not None and not has_pasted_alpha:
+                    if pasted.size != current_alpha.size:
+                        pasted = pasted.resize(current_alpha.size, Image.Resampling.LANCZOS)
+                    pasted.putalpha(current_alpha)
+                pasted.save(dst)
 
-        for cache in (self.full_cache, self.thumb_cache, self.large_thumb_cache):
-            cache.pop(self.current_index, None)
-
-        self.preview_surface = None
-        self.preview_surface_key = None
-        self.needs_preview_refresh = True
+        self.invalidate_frame_cache(self.current_index)
         self.prime_caches_near_current()
         self.rebuild_timeline_metrics()
 
@@ -1268,6 +1885,9 @@ class FrameEditorApp:
         self.full_cache.clear()
         self.thumb_cache.clear()
         self.large_thumb_cache.clear()
+        with self.wand_zone_lock:
+            self.wand_zone_cache.clear()
+            self.wand_preload_targets = []
         self.base_thumb_sizes = []
         self.large_thumb_sizes = []
         self.prefix_positions = []
@@ -1306,6 +1926,7 @@ class FrameEditorApp:
             ("Retarget Size/FPS...", "R", self.retarget_size_fps, bool(self.frames)),
             ("Preview Animation", "P", self.show_animation_preview, bool(self.frames)),
             ("Export Video...", "S", self.export_video, bool(self.frames)),
+            ("Export High Quality GIF...", "", self.export_high_quality_gif, bool(self.frames)),
             ("Exit", "", self.exit_app, True),
         ]
 
@@ -1326,6 +1947,21 @@ class FrameEditorApp:
             ("Match Whole Video To Selected", "", self.match_video_to_selected_reference, bool(self.frames)),
         ]
 
+    def get_background_menu_items(self):
+        mode_label = "Mask Edit Off" if self.mask_edit_mode else "Mask Edit On"
+        wand_label = "Wand Select Off" if self.wand_mode else "Wand Select On"
+        return [
+            (mode_label, "M", self.toggle_mask_edit_mode, bool(self.frames)),
+            (wand_label, "W", self.toggle_wand_mode, bool(self.frames)),
+            ("Clear Wand Selection", "", self.clear_wand_selection, self.wand_selection is not None),
+            ("Brush Restores Image", "", self.set_mask_restore_mode, bool(self.frames)),
+            ("Brush Erases Image", "", self.set_mask_erase_mode, bool(self.frames)),
+            ("Fill Current Mask", "", self.fill_current_mask, bool(self.frames)),
+            ("Erase Current Mask", "", self.clear_current_mask, bool(self.frames)),
+            ("Remove BG Current", "", self.remove_background_current_frame, bool(self.frames)),
+            ("Remove BG Whole Video", "", self.remove_background_whole_video, bool(self.frames)),
+        ]
+
     def get_menu_items(self, menu_name):
         if menu_name == "File":
             return self.get_file_menu_items()
@@ -1333,15 +1969,21 @@ class FrameEditorApp:
             return self.get_frame_menu_items()
         if menu_name == "Color":
             return self.get_color_menu_items()
+        if menu_name == "Background":
+            return self.get_background_menu_items()
         return []
 
     def get_dropdown_rect(self, menu_name):
         item_h = 34
-        width = 260
+        width = 280
         menu_rect = self.menu_rects.get(menu_name, pygame.Rect(8, 8, 68, 34))
         return pygame.Rect(menu_rect.x, TOP_BAR_H - 2, width, item_h * len(self.get_menu_items(menu_name)) + 8)
 
     def handle_menu_click(self, mouse):
+        if self.background_toggle_rect.collidepoint(mouse):
+            self.cycle_preview_background()
+            return True
+
         for menu_name, menu_rect in self.menu_rects.items():
             if menu_rect.collidepoint(mouse):
                 self.active_menu = None if self.active_menu == menu_name else menu_name
@@ -1387,7 +2029,34 @@ class FrameEditorApp:
         if event.button == 1:
             if self.handle_menu_click(mouse):
                 return
-            if preview_rect.collidepoint(mouse):
+            if self.wand_mode and preview_rect.collidepoint(mouse):
+                image_pos = self.preview_to_image_pos(mouse)
+                if image_pos is not None:
+                    with self.wand_zone_lock:
+                        cache_ready = self.current_index in self.wand_zone_cache
+                    if not cache_ready:
+                        self.set_status("Preparing wand zones... please wait", 5000)
+                        self.loading_message = "Preparing wand zones... please wait"
+                        self.force_redraw()
+                    mods = pygame.key.get_mods()
+                    if mods & pygame.KMOD_SHIFT:
+                        self.wand_combine_mode = "add"
+                    elif mods & (pygame.KMOD_CTRL | pygame.KMOD_META):
+                        self.wand_combine_mode = "subtract"
+                    else:
+                        self.wand_combine_mode = "replace"
+                    self.wand_dragging = True
+                    self.wand_start_pos = image_pos
+                    self.wand_start_tolerance = self.wand_tolerance
+                    self.wand_drag_base = self.wand_selection.copy() if self.wand_selection is not None else None
+                    self.wand_last_drag_tolerance = None
+                    self.click_down_pos = mouse
+                    self.update_wand_selection(image_pos, self.wand_combine_mode, self.wand_tolerance)
+            elif self.mask_edit_mode and preview_rect.collidepoint(mouse):
+                self.mask_dragging = True
+                self.mask_paint_mode = "restore"
+                self.paint_mask_at(mouse)
+            elif preview_rect.collidepoint(mouse):
                 self.dragging_preview = True
                 self.preview_drag_last = mouse
             elif timeline_rect.collidepoint(mouse):
@@ -1397,15 +2066,30 @@ class FrameEditorApp:
                 self.scroll_velocity = 0.0
                 self.click_candidate = True
                 self.click_down_pos = mouse
+        elif event.button == 3:
+            if self.mask_edit_mode and preview_rect.collidepoint(mouse):
+                self.mask_dragging = True
+                self.mask_paint_mode = "erase"
+                self.paint_mask_at(mouse)
+        elif event.button == 2:
+            if preview_rect.collidepoint(mouse):
+                self.dragging_preview = True
+                self.preview_drag_last = mouse
         elif event.button == 4:
             self.close_menus()
-            self.zoom_preview(mouse, 1)
+            if self.mask_edit_mode and (pygame.key.get_mods() & pygame.KMOD_SHIFT):
+                self.adjust_mask_brush_size(1)
+            else:
+                self.zoom_preview(mouse, 1)
         elif event.button == 5:
             self.close_menus()
-            self.zoom_preview(mouse, -1)
+            if self.mask_edit_mode and (pygame.key.get_mods() & pygame.KMOD_SHIFT):
+                self.adjust_mask_brush_size(-1)
+            else:
+                self.zoom_preview(mouse, -1)
 
     def handle_mouse_button_up(self, event):
-        if event.button != 1:
+        if event.button not in (1, 2, 3):
             return
 
         if self.dragging_timeline and self.click_candidate:
@@ -1418,10 +2102,21 @@ class FrameEditorApp:
 
         self.dragging_timeline = False
         self.dragging_preview = False
+        self.mask_dragging = False
+        self.wand_dragging = False
+        self.wand_drag_base = None
         self.click_candidate = False
 
     def handle_mouse_motion(self, event):
-        if self.dragging_timeline:
+        if self.wand_dragging and self.wand_mode and self.wand_start_pos is not None:
+            dx = event.pos[0] - self.click_down_pos[0] if self.click_down_pos else 0
+            self.wand_tolerance = max(0, min(255, self.wand_start_tolerance + int(dx / 2)))
+            if self.wand_tolerance != self.wand_last_drag_tolerance:
+                self.wand_last_drag_tolerance = self.wand_tolerance
+                self.update_wand_selection(self.wand_start_pos, self.wand_combine_mode, self.wand_tolerance)
+        elif self.mask_dragging and self.mask_edit_mode:
+            self.paint_mask_at(event.pos)
+        elif self.dragging_timeline:
             dx = event.pos[0] - self.last_mouse_x
             self.scroll_x -= dx * DRAG_MULTIPLIER
             self.last_drag_dx = dx
@@ -1468,6 +2163,10 @@ class FrameEditorApp:
             self.show_animation_preview()
         elif event.key == pygame.K_h:
             self.open_color_tools()
+        elif event.key == pygame.K_m:
+            self.toggle_mask_edit_mode()
+        elif event.key == pygame.K_w:
+            self.toggle_wand_mode()
         elif event.key == pygame.K_s:
             self.export_video()
         elif event.key == pygame.K_c:
@@ -1475,7 +2174,16 @@ class FrameEditorApp:
         elif event.key == pygame.K_v:
             self.paste_frame()
         elif event.key == pygame.K_DELETE:
-            self.delete_current_frame()
+            if self.wand_mode:
+                self.apply_wand_selection_to_alpha(0)
+            else:
+                self.delete_current_frame()
+        elif event.key == pygame.K_RETURN:
+            if self.wand_mode:
+                self.apply_wand_selection_to_alpha(255)
+        elif event.key == pygame.K_INSERT:
+            if self.wand_mode:
+                self.apply_wand_selection_to_alpha(255)
         elif event.key == pygame.K_0:
             self.reset_preview_view()
         elif event.key == pygame.K_ESCAPE:
@@ -1492,9 +2200,10 @@ class FrameEditorApp:
         w, _ = self.get_window_size()
         pygame.draw.rect(self.screen, PANEL, (0, 0, w, TOP_BAR_H))
         self.menu_rects = {}
+        self.background_toggle_rect = pygame.Rect(w - 132, 8, 120, 34)
 
         x = 8
-        for menu_name in ("File", "Frame", "Color"):
+        for menu_name in ("File", "Frame", "Color", "Background"):
             label_surf = self.small_font.render(menu_name, True, TEXT)
             rect = pygame.Rect(x, 8, label_surf.get_width() + 28, 34)
             self.menu_rects[menu_name] = rect
@@ -1508,8 +2217,15 @@ class FrameEditorApp:
         x += 16
         for label in labels:
             surf = self.small_font.render(label, True, TEXT)
+            if x + surf.get_width() + 22 > self.background_toggle_rect.x - 12:
+                break
             self.screen.blit(surf, (x, 16))
             x += surf.get_width() + 22
+
+        pygame.draw.rect(self.screen, (38, 38, 38), self.background_toggle_rect, border_radius=4)
+        pygame.draw.rect(self.screen, (78, 78, 78), self.background_toggle_rect, 1, border_radius=4)
+        bg_label = self.small_font.render(self.preview_background, True, TEXT)
+        self.screen.blit(bg_label, bg_label.get_rect(center=self.background_toggle_rect.center))
         return
 
         button_color = (46, 46, 46) if self.file_menu_open else (38, 38, 38)
@@ -1621,6 +2337,57 @@ class FrameEditorApp:
             status_badge.fill((0, 0, 0, 150))
             self.screen.blit(status_badge, (rect.x + 12, rect.bottom - status.get_height() - 22))
             self.screen.blit(status, (rect.x + 20, rect.bottom - status.get_height() - 17))
+
+        if self.mask_edit_mode:
+            mouse = pygame.mouse.get_pos()
+            if rect.collidepoint(mouse) and self.preview_to_image_pos(mouse) is not None:
+                full = self.load_full_surface(self.current_index)
+                img_w, img_h = full.get_size()
+                fit_scale = min(rect.w / img_w, rect.h / img_h)
+                scale = max(0.05, fit_scale * self.preview_zoom)
+                radius = max(1, int(self.mask_brush_size * scale))
+                color = (80, 180, 255) if self.mask_paint_mode == "restore" else (255, 100, 100)
+                pygame.draw.circle(self.screen, color, mouse, radius, 2)
+                pygame.draw.circle(self.screen, (255, 255, 255), mouse, max(1, radius // 6), 1)
+
+        if self.wand_mode and self.wand_selection is not None:
+            self.draw_wand_selection_overlay(rect)
+
+    def draw_wand_selection_overlay(self, rect):
+        if self.wand_selection is None or not self.frames:
+            return
+
+        try:
+            import numpy as np
+        except ImportError:
+            return
+
+        full = self.load_full_surface(self.current_index)
+        img_w, img_h = full.get_size()
+        if self.wand_selection.shape != (img_h, img_w):
+            return
+
+        fit_scale = min(rect.w / img_w, rect.h / img_h)
+        scale = max(0.05, fit_scale * self.preview_zoom)
+        draw_w = max(1, int(img_w * scale))
+        draw_h = max(1, int(img_h * scale))
+        x = rect.x + (rect.w - draw_w) // 2 + int(self.preview_offset[0])
+        y = rect.y + (rect.h - draw_h) // 2 + int(self.preview_offset[1])
+
+        selection = self.wand_selection
+        edge = selection.copy()
+        edge[1:, :] &= selection[:-1, :]
+        edge[:-1, :] &= selection[1:, :]
+        edge[:, 1:] &= selection[:, :-1]
+        edge[:, :-1] &= selection[:, 1:]
+        edge = selection & ~edge
+
+        overlay = np.zeros((img_h, img_w, 4), dtype=np.uint8)
+        overlay[selection] = (80, 170, 255, 70)
+        overlay[edge] = (255, 240, 60, 230)
+        surf = pygame.image.frombuffer(overlay.tobytes(), (img_w, img_h), "RGBA").convert_alpha()
+        surf = pygame.transform.scale(surf, (draw_w, draw_h))
+        self.screen.blit(surf, (x, y))
 
     def draw_timeline(self):
         rect = self.get_timeline_rect()
