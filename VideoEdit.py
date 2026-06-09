@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pygame
 from PIL import Image, ImageGrab, ImageTk
-from tkinter import Tk, Toplevel, Label, Entry, Button, Frame, StringVar, filedialog
+from tkinter import Tk, Toplevel, Label, Entry, Button, Frame, StringVar, Scale, HORIZONTAL, OptionMenu, filedialog
 
 TEMP_DIR = Path("temp_frames")
 BG = (18, 18, 18)
@@ -259,6 +259,11 @@ class FrameEditorApp:
         self.file_menu_open = False
         self.active_menu = None
         self.menu_rects = {}
+        self.color_popup = None
+        self.color_reference_image = None
+        self.color_reference_label = ""
+        self.color_wheel_photo = None
+        self.color_match_method = "HM"
 
         self.tk_root = Tk()
         self.tk_root.withdraw()
@@ -816,6 +821,373 @@ class FrameEditorApp:
         self.status_message = message
         self.status_until = pygame.time.get_ticks() + duration_ms
 
+    def invalidate_frame_cache(self, index=None):
+        if index is None:
+            self.full_cache.clear()
+            self.thumb_cache.clear()
+            self.large_thumb_cache.clear()
+        else:
+            for cache in (self.full_cache, self.thumb_cache, self.large_thumb_cache):
+                cache.pop(index, None)
+
+        self.preview_surface = None
+        self.preview_surface_key = None
+        self.needs_preview_refresh = True
+
+    def save_edited_frame(self, index, image):
+        image.convert("RGB").save(self.frame_paths[index])
+        self.invalidate_frame_cache(index)
+
+    # ---------- color ----------
+    def apply_hue_saturation_to_image(self, image, hue_degrees, saturation_percent):
+        image = image.convert("RGBA")
+        alpha = image.getchannel("A")
+        hsv = image.convert("RGB").convert("HSV")
+        h, s, v = hsv.split()
+
+        hue_shift = int((float(hue_degrees) / 360.0) * 255)
+        h = h.point(lambda value: (value + hue_shift) % 256)
+        sat_scale = max(0.0, float(saturation_percent) / 100.0)
+        s = s.point(lambda value: max(0, min(255, int(value * sat_scale))))
+
+        adjusted = Image.merge("HSV", (h, s, v)).convert("RGBA")
+        adjusted.putalpha(alpha)
+        return adjusted
+
+    def make_color_wheel_image(self, size=160):
+        try:
+            import numpy as np
+        except ImportError:
+            image = Image.new("RGB", (size, size), (28, 28, 28))
+            return image
+
+        center = (size - 1) / 2.0
+        y, x = np.ogrid[:size, :size]
+        dx = x - center
+        dy = y - center
+        radius = np.sqrt(dx * dx + dy * dy)
+        hue = ((np.arctan2(dy, dx) / (2 * np.pi)) + 1.0) % 1.0
+        saturation = np.clip(radius / center, 0, 1)
+        value = np.ones_like(hue)
+
+        i = np.floor(hue * 6).astype(int)
+        f = hue * 6 - i
+        p = value * (1 - saturation)
+        q = value * (1 - f * saturation)
+        t = value * (1 - (1 - f) * saturation)
+
+        rgb = np.zeros((size, size, 3), dtype=np.float32)
+        masks = [i % 6 == n for n in range(6)]
+        rgb[masks[0]] = np.stack([value, t, p], axis=-1)[masks[0]]
+        rgb[masks[1]] = np.stack([q, value, p], axis=-1)[masks[1]]
+        rgb[masks[2]] = np.stack([p, value, t], axis=-1)[masks[2]]
+        rgb[masks[3]] = np.stack([p, q, value], axis=-1)[masks[3]]
+        rgb[masks[4]] = np.stack([t, p, value], axis=-1)[masks[4]]
+        rgb[masks[5]] = np.stack([value, p, q], axis=-1)[masks[5]]
+
+        rgb[radius > center] = (0.11, 0.11, 0.11)
+        return Image.fromarray((rgb * 255).astype("uint8"), "RGB")
+
+    def color_match_image(self, source_image, reference_image):
+        try:
+            import numpy as np
+        except ImportError:
+            raise RuntimeError("Install numpy to use color matching")
+
+        source = source_image.convert("RGBA")
+        alpha = source.getchannel("A")
+        src = np.asarray(source.convert("RGB"), dtype=np.float32)
+        ref = np.asarray(reference_image.convert("RGB"), dtype=np.float32)
+
+        src_mean = src.reshape(-1, 3).mean(axis=0)
+        src_std = src.reshape(-1, 3).std(axis=0)
+        ref_mean = ref.reshape(-1, 3).mean(axis=0)
+        ref_std = ref.reshape(-1, 3).std(axis=0)
+
+        matched = (src - src_mean) * (ref_std / np.maximum(src_std, 1.0)) + ref_mean
+        matched = np.clip(matched, 0, 255).astype("uint8")
+        result = Image.fromarray(matched, "RGB").convert("RGBA")
+        result.putalpha(alpha)
+        return result
+
+    def histogram_match_channel(self, source, reference):
+        try:
+            import numpy as np
+        except ImportError:
+            raise RuntimeError("Install numpy to use color matching")
+
+        source_shape = source.shape
+        source = source.ravel()
+        reference = reference.ravel()
+        src_values, src_inverse, src_counts = np.unique(source, return_inverse=True, return_counts=True)
+        ref_values, ref_counts = np.unique(reference, return_counts=True)
+        src_quantiles = np.cumsum(src_counts).astype(np.float64)
+        src_quantiles /= src_quantiles[-1]
+        ref_quantiles = np.cumsum(ref_counts).astype(np.float64)
+        ref_quantiles /= ref_quantiles[-1]
+        matched = np.interp(src_quantiles, ref_quantiles, ref_values)
+        return matched[src_inverse].reshape(source_shape)
+
+    def histogram_match_image(self, source_image, reference_image):
+        try:
+            import numpy as np
+        except ImportError:
+            raise RuntimeError("Install numpy to use color matching")
+
+        source = source_image.convert("RGBA")
+        alpha = source.getchannel("A")
+        src = np.asarray(source.convert("RGB"), dtype=np.uint8)
+        ref = np.asarray(reference_image.convert("RGB"), dtype=np.uint8)
+        matched = np.zeros_like(src, dtype=np.float32)
+        for channel in range(3):
+            matched[..., channel] = self.histogram_match_channel(src[..., channel], ref[..., channel])
+        result = Image.fromarray(np.clip(matched, 0, 255).astype("uint8"), "RGB").convert("RGBA")
+        result.putalpha(alpha)
+        return result
+
+    def covariance_match_image(self, source_image, reference_image):
+        try:
+            import numpy as np
+        except ImportError:
+            raise RuntimeError("Install numpy to use color matching")
+
+        source = source_image.convert("RGBA")
+        alpha = source.getchannel("A")
+        src = np.asarray(source.convert("RGB"), dtype=np.float32)
+        ref = np.asarray(reference_image.convert("RGB"), dtype=np.float32)
+        src_flat = src.reshape(-1, 3)
+        ref_flat = ref.reshape(-1, 3)
+        src_mean = src_flat.mean(axis=0)
+        ref_mean = ref_flat.mean(axis=0)
+        src_cov = np.cov(src_flat, rowvar=False) + np.eye(3) * 1e-5
+        ref_cov = np.cov(ref_flat, rowvar=False) + np.eye(3) * 1e-5
+
+        src_vals, src_vecs = np.linalg.eigh(src_cov)
+        ref_vals, ref_vecs = np.linalg.eigh(ref_cov)
+        whiten = src_vecs @ np.diag(1.0 / np.sqrt(np.maximum(src_vals, 1e-5))) @ src_vecs.T
+        colorize = ref_vecs @ np.diag(np.sqrt(np.maximum(ref_vals, 1e-5))) @ ref_vecs.T
+        matched = (src_flat - src_mean) @ whiten @ colorize + ref_mean
+        matched = matched.reshape(src.shape)
+        result = Image.fromarray(np.clip(matched, 0, 255).astype("uint8"), "RGB").convert("RGBA")
+        result.putalpha(alpha)
+        return result
+
+    def apply_color_match_method(self, source_image, reference_image, method=None):
+        method = method or self.color_match_method
+        if method == "Reinhard":
+            return self.color_match_image(source_image, reference_image)
+        if method == "HM":
+            return self.histogram_match_image(source_image, reference_image)
+        if method in ("MKL", "MVGD"):
+            return self.covariance_match_image(source_image, reference_image)
+        if method == "HM-MVGD-HM":
+            first = self.histogram_match_image(source_image, reference_image)
+            second = self.covariance_match_image(first, reference_image)
+            return self.histogram_match_image(second, reference_image)
+        if method == "HM-MKL-HM":
+            first = self.histogram_match_image(source_image, reference_image)
+            second = self.covariance_match_image(first, reference_image)
+            return self.histogram_match_image(second, reference_image)
+        return self.histogram_match_image(source_image, reference_image)
+
+    def get_selected_reference_image(self):
+        with Image.open(self.frame_paths[self.current_index]) as image:
+            return image.convert("RGB").copy()
+
+    def set_color_reference_from_frame(self, index=None):
+        if not self.frames:
+            self.set_status("Open a video before setting a reference")
+            return
+
+        if index is None:
+            index = self.current_index
+
+        with Image.open(self.frame_paths[index]) as image:
+            self.color_reference_image = image.convert("RGB").copy()
+        self.color_reference_label = f"Frame {index}"
+        self.set_status(f"Color reference set from frame {index}")
+
+    def match_frame_to_selected_reference(self, index=None):
+        if not self.frames:
+            return
+
+        if index is None:
+            index = self.current_index
+        reference_index = self.current_index
+        if index == reference_index:
+            self.set_status("Selected frame is the color reference")
+            return
+
+        try:
+            reference = self.get_selected_reference_image()
+            with Image.open(self.frame_paths[index]) as image:
+                matched = self.apply_color_match_method(image, reference)
+            self.save_edited_frame(index, matched)
+            self.prime_caches_near_current()
+            self.rebuild_timeline_metrics()
+            self.set_status(f"Matched frame {index} to selected frame using {self.color_match_method}")
+        except RuntimeError as exc:
+            self.set_status(str(exc))
+
+    def match_next_frame_to_selected_reference(self):
+        if not self.frames:
+            return
+        target_index = self.current_index + 1 if self.current_index + 1 < len(self.frames) else self.current_index - 1
+        if target_index < 0:
+            self.set_status("No other frame to match")
+            return
+        self.match_frame_to_selected_reference(target_index)
+
+    def match_video_to_selected_reference(self):
+        if not self.frames:
+            return
+
+        reference_index = self.current_index
+        reference = self.get_selected_reference_image()
+        self.loading_message = "Color matching video to selected frame..."
+        self.force_redraw()
+        try:
+            for i, path in enumerate(self.frame_paths):
+                if i == reference_index:
+                    continue
+                with Image.open(path) as image:
+                    matched = self.apply_color_match_method(image, reference)
+                matched.convert("RGB").save(path)
+        except RuntimeError as exc:
+            self.loading_message = ""
+            self.set_status(str(exc))
+            return
+
+        self.invalidate_frame_cache()
+        self.prime_caches_near_current()
+        self.rebuild_timeline_metrics()
+        self.loading_message = ""
+        self.set_status(f"Matched video to frame {reference_index} using {self.color_match_method}")
+
+    def match_frame_to_color_reference(self, index=None):
+        self.match_frame_to_selected_reference(index)
+
+    def match_video_to_color_reference(self):
+        self.match_video_to_selected_reference()
+
+    def open_color_tools(self):
+        if not self.frames:
+            self.set_status("Open a video before using color tools")
+            return
+
+        if self.color_popup is not None and self.color_popup.winfo_exists():
+            self.color_popup.lift()
+            return
+
+        popup = Toplevel(self.tk_root)
+        popup.title("Color Match")
+        popup.resizable(False, False)
+        self.color_popup = popup
+
+        with Image.open(self.frame_paths[self.current_index]) as image:
+            base_image = image.convert("RGB").copy()
+
+        main = Frame(popup, padx=14, pady=12)
+        main.pack()
+
+        preview_frame = Frame(main)
+        preview_frame.grid(row=0, column=0, columnspan=3, sticky="nsew")
+
+        wheel_image = self.make_color_wheel_image()
+        self.color_wheel_photo = ImageTk.PhotoImage(wheel_image)
+        wheel_label = Label(preview_frame, image=self.color_wheel_photo, cursor="crosshair")
+        wheel_label.grid(row=0, column=0, padx=(0, 14))
+
+        frame_preview = Label(preview_frame, bg="black")
+        frame_preview.grid(row=0, column=1)
+        ref_var = StringVar(value=f"Selected frame {self.current_index} is the reference")
+        Label(main, textvariable=ref_var, anchor="w").grid(row=1, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+
+        Label(main, text="Method").grid(row=2, column=0, sticky="w", pady=(10, 0))
+        method_var = StringVar(value=self.color_match_method)
+        method_menu = OptionMenu(main, method_var, "HM", "Reinhard", "MKL", "MVGD", "HM-MVGD-HM", "HM-MKL-HM")
+        method_menu.grid(row=2, column=1, columnspan=2, sticky="ew", pady=(10, 0))
+
+        Label(main, text="Hue").grid(row=3, column=0, sticky="w", pady=(10, 0))
+        hue_scale = Scale(main, from_=-180, to=180, orient=HORIZONTAL, length=320, resolution=1)
+        hue_scale.grid(row=3, column=1, columnspan=2, sticky="ew", pady=(10, 0))
+
+        Label(main, text="Saturation").grid(row=4, column=0, sticky="w")
+        sat_scale = Scale(main, from_=0, to=200, orient=HORIZONTAL, length=320, resolution=1)
+        sat_scale.set(100)
+        sat_scale.grid(row=4, column=1, columnspan=2, sticky="ew")
+
+        preview_state = {"photo": None}
+
+        def make_adjusted():
+            return self.apply_hue_saturation_to_image(base_image, hue_scale.get(), sat_scale.get())
+
+        def update_color_preview(_value=None):
+            adjusted = make_adjusted().convert("RGB")
+            preview = adjusted.copy()
+            preview.thumbnail((360, 260), Image.Resampling.LANCZOS)
+            photo = ImageTk.PhotoImage(preview)
+            frame_preview.configure(image=photo)
+            frame_preview.image = photo
+            preview_state["photo"] = photo
+
+        def apply_to_current():
+            adjusted = make_adjusted()
+            self.save_edited_frame(self.current_index, adjusted)
+            self.prime_caches_near_current()
+            self.rebuild_timeline_metrics()
+            ref_var.set(f"Selected frame {self.current_index} is the reference")
+            self.set_status(f"Applied color adjustment to selected frame {self.current_index}")
+
+        def match_current():
+            self.color_match_method = method_var.get()
+            self.match_next_frame_to_selected_reference()
+
+        def match_all():
+            self.color_match_method = method_var.get()
+            self.match_video_to_selected_reference()
+
+        def update_method(*_args):
+            self.color_match_method = method_var.get()
+
+        def pick_from_wheel(event):
+            import math
+
+            size = 160
+            center = (size - 1) / 2.0
+            dx = event.x - center
+            dy = event.y - center
+            radius = (dx * dx + dy * dy) ** 0.5
+            if radius > center:
+                return
+            hue_degrees = math.degrees(math.atan2(dy, dx))
+            saturation = int(max(0, min(200, (radius / center) * 200)))
+            hue_scale.set(int(hue_degrees))
+            sat_scale.set(saturation)
+            update_color_preview()
+
+        def close_popup():
+            if self.color_popup is popup:
+                self.color_popup = None
+            popup.destroy()
+
+        hue_scale.configure(command=update_color_preview)
+        sat_scale.configure(command=update_color_preview)
+        method_var.trace_add("write", update_method)
+        wheel_label.bind("<Button-1>", pick_from_wheel)
+        wheel_label.bind("<B1-Motion>", pick_from_wheel)
+
+        buttons = Frame(main)
+        buttons.grid(row=5, column=0, columnspan=3, sticky="e", pady=(12, 0))
+        Button(buttons, text="Apply To Selected", command=apply_to_current).pack(side="left", padx=(0, 8))
+        Button(buttons, text="Match Next Frame", command=match_current).pack(side="left", padx=(0, 8))
+        Button(buttons, text="Match Whole Video", command=match_all).pack(side="left", padx=(0, 8))
+        Button(buttons, text="Close", command=close_popup).pack(side="left")
+
+        popup.protocol("WM_DELETE_WINDOW", close_popup)
+        popup.bind("<Escape>", lambda _event: close_popup())
+        update_color_preview()
+
     # ---------- copy / paste ----------
     def copy_frame(self):
         if not self.frames:
@@ -947,11 +1319,20 @@ class FrameEditorApp:
             ("Reset Preview", "0", self.reset_preview_view, bool(self.frames)),
         ]
 
+    def get_color_menu_items(self):
+        return [
+            ("Color Tools...", "H", self.open_color_tools, bool(self.frames)),
+            ("Match Next Frame To Selected", "", self.match_next_frame_to_selected_reference, bool(self.frames)),
+            ("Match Whole Video To Selected", "", self.match_video_to_selected_reference, bool(self.frames)),
+        ]
+
     def get_menu_items(self, menu_name):
         if menu_name == "File":
             return self.get_file_menu_items()
         if menu_name == "Frame":
             return self.get_frame_menu_items()
+        if menu_name == "Color":
+            return self.get_color_menu_items()
         return []
 
     def get_dropdown_rect(self, menu_name):
@@ -1085,6 +1466,8 @@ class FrameEditorApp:
                 self.retarget_size_fps()
         elif event.key == pygame.K_p:
             self.show_animation_preview()
+        elif event.key == pygame.K_h:
+            self.open_color_tools()
         elif event.key == pygame.K_s:
             self.export_video()
         elif event.key == pygame.K_c:
@@ -1111,7 +1494,7 @@ class FrameEditorApp:
         self.menu_rects = {}
 
         x = 8
-        for menu_name in ("File", "Frame"):
+        for menu_name in ("File", "Frame", "Color"):
             label_surf = self.small_font.render(menu_name, True, TEXT)
             rect = pygame.Rect(x, 8, label_surf.get_width() + 28, 34)
             self.menu_rects[menu_name] = rect
