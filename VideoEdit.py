@@ -257,7 +257,8 @@ class FrameEditorApp:
         self.status_until = 0
         self.loading_message = ""
         self.file_menu_open = False
-        self.file_menu_rect = pygame.Rect(8, 8, 68, 34)
+        self.active_menu = None
+        self.menu_rects = {}
 
         self.tk_root = Tk()
         self.tk_root.withdraw()
@@ -292,8 +293,8 @@ class FrameEditorApp:
         self.draw_top_bar()
         self.draw_preview()
         self.draw_timeline()
-        if self.file_menu_open:
-            self.draw_file_menu()
+        if self.active_menu is not None:
+            self.draw_active_menu()
         pygame.display.flip()
 
     def open_video_path(self, path):
@@ -305,7 +306,7 @@ class FrameEditorApp:
             self.set_status("Unsupported video or animation file")
             return
 
-        self.file_menu_open = False
+        self.close_menus()
         self.loading_message = f"Opening {path.name}..."
         self.force_redraw()
 
@@ -358,6 +359,12 @@ class FrameEditorApp:
             return
 
         self.open_video_path(path)
+
+    def reload_video(self):
+        if self.video_path is None:
+            self.set_status("No source video to reload")
+            return
+        self.open_video_path(self.video_path)
 
     def make_even(self, value):
         value = max(2, int(value))
@@ -913,46 +920,71 @@ class FrameEditorApp:
             self.set_status("Deleted last frame")
 
     # ---------- menu ----------
+    def close_menus(self):
+        self.file_menu_open = False
+        self.active_menu = None
+
+    def exit_app(self):
+        pygame.event.post(pygame.event.Event(pygame.QUIT))
+
     def get_file_menu_items(self):
         return [
             ("Open Video...", "O", self.open_video, True),
+            ("Reload Source", "Ctrl+R", self.reload_video, self.video_path is not None),
             ("Retarget Size/FPS...", "R", self.retarget_size_fps, bool(self.frames)),
             ("Preview Animation", "P", self.show_animation_preview, bool(self.frames)),
             ("Export Video...", "S", self.export_video, bool(self.frames)),
+            ("Exit", "", self.exit_app, True),
+        ]
+
+    def get_frame_menu_items(self):
+        return [
             ("Copy Current Frame", "C", self.copy_frame, bool(self.frames)),
             ("Paste Over Current Frame", "V", self.paste_frame, bool(self.frames)),
             ("Delete Current Frame", "Del", self.delete_current_frame, bool(self.frames)),
+            ("First Frame", "Home", lambda: self.set_current_index(0), bool(self.frames)),
+            ("Last Frame", "End", lambda: self.set_current_index(len(self.frames) - 1), bool(self.frames)),
             ("Reset Preview", "0", self.reset_preview_view, bool(self.frames)),
         ]
 
-    def get_file_dropdown_rect(self):
+    def get_menu_items(self, menu_name):
+        if menu_name == "File":
+            return self.get_file_menu_items()
+        if menu_name == "Frame":
+            return self.get_frame_menu_items()
+        return []
+
+    def get_dropdown_rect(self, menu_name):
         item_h = 34
         width = 260
-        return pygame.Rect(self.file_menu_rect.x, TOP_BAR_H - 2, width, item_h * len(self.get_file_menu_items()) + 8)
+        menu_rect = self.menu_rects.get(menu_name, pygame.Rect(8, 8, 68, 34))
+        return pygame.Rect(menu_rect.x, TOP_BAR_H - 2, width, item_h * len(self.get_menu_items(menu_name)) + 8)
 
     def handle_menu_click(self, mouse):
-        if self.file_menu_rect.collidepoint(mouse):
-            self.file_menu_open = not self.file_menu_open
-            return True
+        for menu_name, menu_rect in self.menu_rects.items():
+            if menu_rect.collidepoint(mouse):
+                self.active_menu = None if self.active_menu == menu_name else menu_name
+                self.file_menu_open = self.active_menu == "File"
+                return True
 
-        if not self.file_menu_open:
+        if self.active_menu is None:
             return False
 
-        dropdown = self.get_file_dropdown_rect()
+        dropdown = self.get_dropdown_rect(self.active_menu)
         if not dropdown.collidepoint(mouse):
-            self.file_menu_open = False
+            self.close_menus()
             return False
 
         item_h = 34
         y = dropdown.y + 4
-        for label, _shortcut, action, enabled in self.get_file_menu_items():
+        for label, _shortcut, action, enabled in self.get_menu_items(self.active_menu):
             item_rect = pygame.Rect(dropdown.x + 4, y, dropdown.w - 8, item_h)
             if item_rect.collidepoint(mouse):
-                self.file_menu_open = False
+                self.close_menus()
                 if enabled:
                     action()
                 else:
-                    self.set_status(f"{label} needs an open video")
+                    self.set_status(f"{label} is not available")
                 return True
             y += item_h
 
@@ -985,10 +1017,10 @@ class FrameEditorApp:
                 self.click_candidate = True
                 self.click_down_pos = mouse
         elif event.button == 4:
-            self.file_menu_open = False
+            self.close_menus()
             self.zoom_preview(mouse, 1)
         elif event.button == 5:
-            self.file_menu_open = False
+            self.close_menus()
             self.zoom_preview(mouse, -1)
 
     def handle_mouse_button_up(self, event):
@@ -1027,6 +1059,7 @@ class FrameEditorApp:
 
     def handle_keydown(self, event):
         now = pygame.time.get_ticks()
+        ctrl_held = bool(event.mod & (pygame.KMOD_CTRL | pygame.KMOD_META))
         if event.key == pygame.K_LEFT:
             self.left_held = True
             self.left_next_repeat = now + KEY_REPEAT_DELAY_MS
@@ -1046,7 +1079,10 @@ class FrameEditorApp:
         elif event.key == pygame.K_o:
             self.open_video()
         elif event.key == pygame.K_r:
-            self.retarget_size_fps()
+            if ctrl_held:
+                self.reload_video()
+            else:
+                self.retarget_size_fps()
         elif event.key == pygame.K_p:
             self.show_animation_preview()
         elif event.key == pygame.K_s:
@@ -1060,7 +1096,7 @@ class FrameEditorApp:
         elif event.key == pygame.K_0:
             self.reset_preview_view()
         elif event.key == pygame.K_ESCAPE:
-            self.file_menu_open = False
+            self.close_menus()
 
     def handle_keyup(self, event):
         if event.key == pygame.K_LEFT:
@@ -1072,6 +1108,27 @@ class FrameEditorApp:
     def draw_top_bar(self):
         w, _ = self.get_window_size()
         pygame.draw.rect(self.screen, PANEL, (0, 0, w, TOP_BAR_H))
+        self.menu_rects = {}
+
+        x = 8
+        for menu_name in ("File", "Frame"):
+            label_surf = self.small_font.render(menu_name, True, TEXT)
+            rect = pygame.Rect(x, 8, label_surf.get_width() + 28, 34)
+            self.menu_rects[menu_name] = rect
+            button_color = (46, 46, 46) if self.active_menu == menu_name else (38, 38, 38)
+            pygame.draw.rect(self.screen, button_color, rect, border_radius=4)
+            pygame.draw.rect(self.screen, (78, 78, 78), rect, 1, border_radius=4)
+            self.screen.blit(label_surf, label_surf.get_rect(center=rect.center))
+            x = rect.right + 6
+
+        labels = ["Drop video here to open", "Mouse Wheel Zoom", "Drag Preview Pan", "Left/Right Frame"]
+        x += 16
+        for label in labels:
+            surf = self.small_font.render(label, True, TEXT)
+            self.screen.blit(surf, (x, 16))
+            x += surf.get_width() + 22
+        return
+
         button_color = (46, 46, 46) if self.file_menu_open else (38, 38, 38)
         pygame.draw.rect(self.screen, button_color, self.file_menu_rect, border_radius=4)
         pygame.draw.rect(self.screen, (78, 78, 78), self.file_menu_rect, 1, border_radius=4)
@@ -1103,7 +1160,33 @@ class FrameEditorApp:
             self.screen.blit(surf, (x, 16))
             x += surf.get_width() + 22
 
+    def draw_active_menu(self):
+        if self.active_menu is None:
+            return
+
+        dropdown = self.get_dropdown_rect(self.active_menu)
+        pygame.draw.rect(self.screen, (34, 34, 34), dropdown, border_radius=4)
+        pygame.draw.rect(self.screen, (84, 84, 84), dropdown, 1, border_radius=4)
+
+        mouse = pygame.mouse.get_pos()
+        item_h = 34
+        y = dropdown.y + 4
+        for label, shortcut, _action, enabled in self.get_menu_items(self.active_menu):
+            item_rect = pygame.Rect(dropdown.x + 4, y, dropdown.w - 8, item_h)
+            if enabled and item_rect.collidepoint(mouse):
+                pygame.draw.rect(self.screen, (58, 58, 58), item_rect, border_radius=3)
+
+            color = TEXT if enabled else (120, 120, 120)
+            label_surf = self.small_font.render(label, True, color)
+            shortcut_surf = self.small_font.render(shortcut, True, color)
+            self.screen.blit(label_surf, (item_rect.x + 10, item_rect.y + 9))
+            self.screen.blit(shortcut_surf, (item_rect.right - shortcut_surf.get_width() - 10, item_rect.y + 9))
+            y += item_h
+
     def draw_file_menu(self):
+        self.draw_active_menu()
+        return
+
         dropdown = self.get_file_dropdown_rect()
         pygame.draw.rect(self.screen, (34, 34, 34), dropdown, border_radius=4)
         pygame.draw.rect(self.screen, (84, 84, 84), dropdown, 1, border_radius=4)
@@ -1240,8 +1323,8 @@ class FrameEditorApp:
             self.draw_top_bar()
             self.draw_preview()
             self.draw_timeline()
-            if self.file_menu_open:
-                self.draw_file_menu()
+            if self.active_menu is not None:
+                self.draw_active_menu()
             pygame.display.flip()
             self.clock.tick(60)
 
