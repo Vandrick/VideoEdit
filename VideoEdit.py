@@ -4,11 +4,12 @@ import subprocess
 import sys
 import ctypes
 import io
+import time
 from pathlib import Path
 
 import pygame
 from PIL import Image, ImageGrab, ImageTk
-from tkinter import Tk, filedialog, simpledialog
+from tkinter import Tk, Toplevel, Label, Entry, Button, Frame, StringVar, filedialog
 
 TEMP_DIR = Path("temp_frames")
 BG = (18, 18, 18)
@@ -216,6 +217,11 @@ class FrameEditorApp:
         self.frame_paths = []
         self.current_index = 0
         self.fps = 30.0
+        self.retarget_width = None
+        self.retarget_height = None
+        self.retarget_fps = None
+        self.preview_popup = None
+        self.retarget_popup = None
 
         self.full_cache = {}
         self.thumb_cache = {}
@@ -314,6 +320,7 @@ class FrameEditorApp:
         self.frame_paths = sorted(TEMP_DIR.glob("frame_*.png"))
         self.frames = [p.name for p in self.frame_paths]
         self.current_index = 0
+        self.initialize_retarget_settings()
         self.scroll_x = 0.0
         self.scroll_velocity = 0.0
         self.preview_zoom = 1.0
@@ -352,6 +359,183 @@ class FrameEditorApp:
 
         self.open_video_path(path)
 
+    def make_even(self, value):
+        value = max(2, int(value))
+        return value if value % 2 == 0 else value + 1
+
+    def get_current_frame_size(self):
+        if not self.frame_paths:
+            return None
+        index = max(0, min(self.current_index, len(self.frame_paths) - 1))
+        with Image.open(self.frame_paths[index]) as image:
+            return image.size
+
+    def initialize_retarget_settings(self):
+        size = self.get_current_frame_size()
+        if size is None:
+            self.retarget_width = None
+            self.retarget_height = None
+            self.retarget_fps = None
+            return
+
+        self.retarget_width = self.make_even(size[0])
+        self.retarget_height = self.make_even(size[1])
+        self.retarget_fps = max(1.0, float(self.fps))
+
+    def get_retarget_settings(self):
+        if not self.frames:
+            return None
+        if self.retarget_width is None or self.retarget_height is None or self.retarget_fps is None:
+            self.initialize_retarget_settings()
+        return self.retarget_width, self.retarget_height, self.retarget_fps
+
+    def retarget_size_fps(self):
+        if not self.frames:
+            self.set_status("Open a video before retargeting")
+            return
+
+        width, height, fps = self.get_retarget_settings()
+
+        if self.retarget_popup is not None and self.retarget_popup.winfo_exists():
+            self.retarget_popup.lift()
+            return
+
+        popup = Toplevel(self.tk_root)
+        popup.title("Retarget Size/FPS")
+        popup.resizable(False, False)
+        self.retarget_popup = popup
+
+        width_var = StringVar(value=str(width))
+        height_var = StringVar(value=str(height))
+        fps_var = StringVar(value=f"{fps:.3f}")
+        error_var = StringVar(value="")
+
+        fields = Frame(popup, padx=14, pady=12)
+        fields.pack()
+
+        def add_row(row, label, variable):
+            Label(fields, text=label, anchor="w").grid(row=row, column=0, sticky="w", pady=4)
+            entry = Entry(fields, textvariable=variable, width=14)
+            entry.grid(row=row, column=1, sticky="ew", padx=(12, 0), pady=4)
+            return entry
+
+        width_entry = add_row(0, "Width", width_var)
+        add_row(1, "Height", height_var)
+        add_row(2, "FPS", fps_var)
+        Label(fields, textvariable=error_var, fg="red", anchor="w").grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        buttons = Frame(fields)
+        buttons.grid(row=4, column=0, columnspan=2, sticky="e", pady=(12, 0))
+
+        def close_popup():
+            if self.retarget_popup is popup:
+                self.retarget_popup = None
+            popup.destroy()
+
+        def apply_values():
+            try:
+                new_width = int(width_var.get())
+                new_height = int(height_var.get())
+                new_fps = float(fps_var.get())
+            except ValueError:
+                error_var.set("Use numbers for width, height, and FPS.")
+                return
+
+            if new_width < 2 or new_height < 2 or new_fps <= 0:
+                error_var.set("Width/height must be 2+, FPS must be above 0.")
+                return
+
+            self.retarget_width = self.make_even(new_width)
+            self.retarget_height = self.make_even(new_height)
+            self.retarget_fps = float(new_fps)
+            self.set_status(f"Retarget {self.retarget_width}x{self.retarget_height} @ {self.retarget_fps:.3f} FPS")
+            close_popup()
+
+        Button(buttons, text="Cancel", command=close_popup).pack(side="right", padx=(8, 0))
+        Button(buttons, text="Apply", command=apply_values).pack(side="right")
+
+        popup.protocol("WM_DELETE_WINDOW", close_popup)
+        popup.bind("<Return>", lambda _event: apply_values())
+        popup.bind("<Escape>", lambda _event: close_popup())
+        width_entry.focus_set()
+
+    def show_animation_preview(self):
+        if not self.frames:
+            self.set_status("Open a video before previewing")
+            return
+
+        width, height, fps = self.get_retarget_settings()
+        if self.preview_popup is not None and self.preview_popup.winfo_exists():
+            self.preview_popup.destroy()
+
+        popup = Toplevel(self.tk_root)
+        popup.title(f"Preview - {width}x{height} @ {fps:.3f} FPS")
+        popup.resizable(False, False)
+        image_label = Label(popup, bg="black")
+        image_label.pack()
+        image_label.configure(text="Preparing preview...", fg="white", compound="center")
+
+        self.preview_popup = popup
+
+        def close_preview():
+            if self.preview_popup is popup:
+                self.preview_popup = None
+            popup.destroy()
+
+        popup.protocol("WM_DELETE_WINDOW", close_preview)
+
+        preview_frames = []
+        try:
+            for frame_number, path in enumerate(self.frame_paths, start=1):
+                if self.preview_popup is not popup or not popup.winfo_exists():
+                    return
+
+                image_label.configure(text=f"Preparing preview {frame_number}/{len(self.frame_paths)}")
+                popup.update_idletasks()
+                popup.update()
+
+                with Image.open(path) as image:
+                    image = image.convert("RGB").resize((width, height), Image.Resampling.LANCZOS)
+                    preview_frames.append(ImageTk.PhotoImage(image))
+        except MemoryError:
+            close_preview()
+            self.set_status("Preview too large to fit in memory")
+            return
+
+        if not preview_frames:
+            close_preview()
+            self.set_status("No frames available for preview")
+            return
+
+        image_label.configure(text="", image=preview_frames[0])
+        image_label.image = preview_frames[0]
+        image_label.preview_frames = preview_frames
+        start_time = time.perf_counter()
+        frame_state = {"index": 0}
+
+        def draw_next_frame():
+            if self.preview_popup is not popup or not popup.winfo_exists():
+                return
+
+            frame_count = len(preview_frames)
+            clip_duration = frame_count / fps
+            elapsed = (time.perf_counter() - start_time) % clip_duration
+            target_index = int(elapsed * fps) % frame_count
+
+            if target_index != frame_state["index"]:
+                photo = preview_frames[target_index]
+                image_label.configure(image=photo)
+                image_label.image = photo
+                frame_state["index"] = target_index
+
+            schedule_elapsed = (time.perf_counter() - start_time) % clip_duration
+            next_frame_at = ((int(schedule_elapsed * fps) + 1) / fps)
+            delay_ms = max(1, int((next_frame_at - schedule_elapsed) * 1000))
+            popup.after(delay_ms, draw_next_frame)
+
+        draw_next_frame()
+        self.set_status("Preview playing")
+
     def export_video(self):
         if not self.frames:
             return
@@ -364,15 +548,18 @@ class FrameEditorApp:
             return
 
         temp_video = TEMP_DIR / "_video_only_export.mp4"
+        width, height, output_fps = self.get_retarget_settings()
 
         subprocess.run(
             [
                 "ffmpeg",
                 "-y",
                 "-framerate",
-                str(self.fps),
+                str(output_fps),
                 "-i",
                 str(TEMP_DIR / "frame_%06d.png"),
+                "-vf",
+                f"scale={width}:{height}",
                 "-c:v",
                 "libx264",
                 "-pix_fmt",
@@ -720,12 +907,17 @@ class FrameEditorApp:
             self.preview_offset = [0.0, 0.0]
             self.scroll_x = 0.0
             self.scroll_velocity = 0.0
+            self.retarget_width = None
+            self.retarget_height = None
+            self.retarget_fps = None
             self.set_status("Deleted last frame")
 
     # ---------- menu ----------
     def get_file_menu_items(self):
         return [
             ("Open Video...", "O", self.open_video, True),
+            ("Retarget Size/FPS...", "R", self.retarget_size_fps, bool(self.frames)),
+            ("Preview Animation", "P", self.show_animation_preview, bool(self.frames)),
             ("Export Video...", "S", self.export_video, bool(self.frames)),
             ("Copy Current Frame", "C", self.copy_frame, bool(self.frames)),
             ("Paste Over Current Frame", "V", self.paste_frame, bool(self.frames)),
@@ -735,7 +927,7 @@ class FrameEditorApp:
 
     def get_file_dropdown_rect(self):
         item_h = 34
-        width = 230
+        width = 260
         return pygame.Rect(self.file_menu_rect.x, TOP_BAR_H - 2, width, item_h * len(self.get_file_menu_items()) + 8)
 
     def handle_menu_click(self, mouse):
@@ -853,6 +1045,10 @@ class FrameEditorApp:
                 self.set_current_index(len(self.frames) - 1)
         elif event.key == pygame.K_o:
             self.open_video()
+        elif event.key == pygame.K_r:
+            self.retarget_size_fps()
+        elif event.key == pygame.K_p:
+            self.show_animation_preview()
         elif event.key == pygame.K_s:
             self.export_video()
         elif event.key == pygame.K_c:
@@ -942,8 +1138,9 @@ class FrameEditorApp:
         if self.preview_surface is not None:
             self.screen.blit(self.preview_surface, rect.topleft)
 
+        width, height, output_fps = self.get_retarget_settings()
         frame_text = self.font.render(
-            f"Frame {self.current_index} / {len(self.frames) - 1}   FPS {self.fps:.3f}   Zoom {self.preview_zoom:.2f}x",
+            f"Frame {self.current_index} / {len(self.frames) - 1}   Source {self.fps:.3f} FPS   Output {width}x{height} @ {output_fps:.3f} FPS   Zoom {self.preview_zoom:.2f}x",
             True,
             TEXT,
         )
@@ -1031,6 +1228,12 @@ class FrameEditorApp:
                     self.handle_keyup(event)
                 elif event.type == pygame.DROPFILE:
                     self.handle_dropfile(event.file)
+
+            try:
+                self.tk_root.update_idletasks()
+                self.tk_root.update()
+            except Exception:
+                pass
 
             self.update()
             self.screen.fill(BG)
