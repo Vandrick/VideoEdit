@@ -3,14 +3,16 @@ import shutil
 import subprocess
 import sys
 import ctypes
+import importlib
 import io
+import gc
 import time
 import threading
 from pathlib import Path
 
 import pygame
-from PIL import Image, ImageGrab, ImageTk
-from tkinter import Tk, Toplevel, Label, Entry, Button, Frame, StringVar, Scale, HORIZONTAL, OptionMenu, filedialog
+from PIL import Image, ImageEnhance, ImageGrab, ImageTk
+from tkinter import Tk, Toplevel, Label, Entry, Button, Frame, StringVar, Scale, HORIZONTAL, OptionMenu, Text, filedialog, messagebox
 
 TEMP_DIR = Path("temp_frames")
 BG = (18, 18, 18)
@@ -36,9 +38,13 @@ DRAG_MULTIPLIER = 1.0
 CACHE_RADIUS = 160
 THUMB_SPACING = 8
 TIMELINE_SIDE_PAD = 20
+FILE_RETRY_COUNT = 12
+FILE_RETRY_DELAY = 0.08
 SUPPORTED_VIDEO_TYPES = ".mp4 .mov .avi .mkv .webm .m4v .gif"
 SUPPORTED_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".gif"}
+DEFAULT_IMAGE_FPS = 16.0
 SUPPORTED_IMAGE_TYPES = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
+FFMPEG_ZIP_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 
 IS_WINDOWS = sys.platform.startswith("win")
 if IS_WINDOWS:
@@ -355,7 +361,11 @@ class FrameEditorApp:
         self.color_reference_image = None
         self.color_reference_label = ""
         self.color_wheel_photo = None
+        self.color_tool_refresh = None
         self.color_match_method = "HM"
+        self.color_blend_prev_weight = 25.0
+        self.color_blend_current_weight = 50.0
+        self.color_blend_next_weight = 25.0
         self.mask_edit_mode = False
         self.mask_paint_mode = "restore"
         self.mask_brush_size = 12
@@ -376,15 +386,156 @@ class FrameEditorApp:
         self.wand_preload_running = False
         self.preview_background = "Checker"
         self.background_toggle_rect = pygame.Rect(0, 0, 120, 34)
+        self.rembg_settings_popup = None
+        self.rembg_model = "isnet-anime"
+        self.rembg_alpha_matting = True
+        self.rembg_fg_threshold = 240
+        self.rembg_bg_threshold = 10
+        self.rembg_erode_size = 10
+        self.rembg_sessions = {}
+        self.ffmpeg_help_popup = None
 
         self.tk_root = Tk()
         self.tk_root.withdraw()
+        self.check_ffmpeg_on_startup()
 
     # ---------- ffmpeg ----------
+    def app_search_dirs(self):
+        dirs = [Path.cwd()]
+        if getattr(sys, "frozen", False):
+            dirs.append(Path(sys.executable).resolve().parent)
+        else:
+            dirs.append(Path(__file__).resolve().parent)
+        unique_dirs = []
+        for folder in dirs:
+            if folder not in unique_dirs:
+                unique_dirs.append(folder)
+        return unique_dirs
+
+    def find_app_tool(self, name):
+        names = [name]
+        if IS_WINDOWS and not name.lower().endswith(".exe"):
+            names.insert(0, f"{name}.exe")
+        for folder in self.app_search_dirs():
+            for candidate_name in names:
+                candidate = folder / candidate_name
+                if candidate.exists():
+                    return str(candidate)
+        return shutil.which(name)
+
+    def has_ffmpeg_tools(self):
+        return bool(self.find_app_tool("ffmpeg") and self.find_app_tool("ffprobe"))
+
+    def get_ffmpeg_tool(self, name):
+        tool = self.find_app_tool(name)
+        if not tool:
+            self.show_ffmpeg_missing_help()
+            self.set_status("FFmpeg not found", 5000)
+            return None
+        return tool
+
+    def build_ffmpeg_install_message(self):
+        working_dir = Path.cwd().resolve()
+        curl_path = shutil.which("curl")
+        wget_path = shutil.which("wget")
+        lines = [
+            "FFmpeg was not found.",
+            "",
+            f"VideoEdit looked in the current working folder and on PATH.",
+            f"Current working folder:",
+            str(working_dir),
+            "",
+        ]
+
+        if curl_path or wget_path:
+            downloader = "curl" if curl_path else "wget"
+            download_line = (
+                f'curl.exe -L "{FFMPEG_ZIP_URL}" -o $zip'
+                if downloader == "curl"
+                else f'wget.exe "{FFMPEG_ZIP_URL}" -O $zip'
+            )
+            lines.extend(
+                [
+                    f"{downloader} was found on PATH. Open PowerShell, paste this command, then restart VideoEdit:",
+                    "",
+                    f'Set-Location -LiteralPath "{working_dir}"',
+                    '$ErrorActionPreference = "Stop"',
+                    '$zip = Join-Path (Get-Location) "ffmpeg-release-essentials.zip"',
+                    '$tmp = Join-Path (Get-Location) "ffmpeg_extract"',
+                    download_line,
+                    'Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue',
+                    'Expand-Archive $zip -DestinationPath $tmp -Force',
+                    '$bin = Get-ChildItem $tmp -Recurse -Filter ffmpeg.exe | Select-Object -First 1 -ExpandProperty DirectoryName',
+                    'Copy-Item (Join-Path $bin "ffmpeg.exe") (Join-Path (Get-Location) "ffmpeg.exe") -Force',
+                    'Copy-Item (Join-Path $bin "ffprobe.exe") (Join-Path (Get-Location) "ffprobe.exe") -Force',
+                    'Remove-Item $tmp -Recurse -Force',
+                    'Remove-Item $zip -Force',
+                    '.\\ffmpeg.exe -version',
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "curl and wget were not found on PATH.",
+                    "",
+                    "Download the Windows release essentials ZIP here:",
+                    FFMPEG_ZIP_URL,
+                    "",
+                    "Extract the ZIP, open its bin folder, then copy these files into the current working folder above:",
+                    "ffmpeg.exe",
+                    "ffprobe.exe",
+                    "",
+                    "Restart VideoEdit after copying them.",
+                ]
+            )
+
+        return "\n".join(lines)
+
+    def show_ffmpeg_missing_help(self):
+        if self.ffmpeg_help_popup is not None and self.ffmpeg_help_popup.winfo_exists():
+            self.ffmpeg_help_popup.lift()
+            return
+
+        popup = Toplevel(self.tk_root)
+        popup.title("FFmpeg Not Found")
+        popup.geometry("820x520")
+        popup.resizable(True, True)
+        self.ffmpeg_help_popup = popup
+
+        Label(popup, text="FFmpeg is required to open/export videos and GIFs.").pack(anchor="w", padx=12, pady=(12, 6))
+        text = Text(popup, wrap="word", height=22)
+        text.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+        text.insert("1.0", self.build_ffmpeg_install_message())
+
+        buttons = Frame(popup)
+        buttons.pack(fill="x", padx=12, pady=(0, 12))
+
+        def copy_text():
+            self.tk_root.clipboard_clear()
+            self.tk_root.clipboard_append(text.get("1.0", "end-1c"))
+            self.set_status("Copied FFmpeg instructions")
+
+        def close_popup():
+            if self.ffmpeg_help_popup is popup:
+                self.ffmpeg_help_popup = None
+            popup.destroy()
+
+        Button(buttons, text="Copy Instructions", command=copy_text).pack(side="left")
+        Button(buttons, text="Close", command=close_popup).pack(side="right")
+        popup.protocol("WM_DELETE_WINDOW", close_popup)
+        self.set_status("FFmpeg not found; install instructions opened", 5000)
+
+    def check_ffmpeg_on_startup(self):
+        if not self.has_ffmpeg_tools():
+            self.show_ffmpeg_missing_help()
+
     def detect_fps(self, file_path):
         try:
+            ffprobe = self.get_ffmpeg_tool("ffprobe")
+            if not ffprobe:
+                return 30.0
             cmd = [
-                "ffprobe",
+                ffprobe,
                 "-v", "error",
                 "-select_streams", "v:0",
                 "-show_entries", "stream=r_frame_rate",
@@ -400,10 +551,15 @@ class FrameEditorApp:
             return 30.0
 
     def extract_frames(self, video_path):
+        ffmpeg = self.get_ffmpeg_tool("ffmpeg")
+        if not ffmpeg:
+            raise FileNotFoundError("ffmpeg.exe was not found")
         if TEMP_DIR.exists():
-            shutil.rmtree(TEMP_DIR)
+            result = self.retry_file_operation("clear temporary frames", lambda: shutil.rmtree(TEMP_DIR), TEMP_DIR)
+            if result is None and TEMP_DIR.exists():
+                raise RuntimeError("Could not clear temporary frames")
         TEMP_DIR.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["ffmpeg", "-y", "-i", str(video_path), str(TEMP_DIR / "frame_%06d.png")], check=True)
+        subprocess.run([ffmpeg, "-y", "-i", str(video_path), str(TEMP_DIR / "frame_%06d.png")], check=True)
 
     def force_redraw(self):
         self.screen.fill(BG)
@@ -421,6 +577,9 @@ class FrameEditorApp:
             return
         if path.suffix.lower() not in SUPPORTED_VIDEO_EXTS:
             self.set_status("Unsupported video or animation file")
+            return
+        if not self.has_ffmpeg_tools():
+            self.show_ffmpeg_missing_help()
             return
 
         self.close_menus()
@@ -478,6 +637,66 @@ class FrameEditorApp:
 
         self.open_video_path(path)
 
+    def open_image_path(self, path):
+        path = Path(path)
+        if not path.exists():
+            self.set_status("File not found")
+            return
+        if path.suffix.lower() not in SUPPORTED_IMAGE_TYPES:
+            self.set_status("Unsupported image file")
+            return
+
+        self.close_menus()
+        self.loading_message = f"Opening {path.name}..."
+        self.force_redraw()
+
+        if TEMP_DIR.exists():
+            result = self.retry_file_operation("clear temporary frames", lambda: shutil.rmtree(TEMP_DIR), TEMP_DIR)
+            if result is None and TEMP_DIR.exists():
+                self.loading_message = ""
+                return
+        TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+        image = self.open_image_copy(path, "RGBA", "open image")
+        if image is None:
+            self.loading_message = ""
+            return
+        if not self.save_image_retry(image, TEMP_DIR / "frame_000001.png", "save image frame"):
+            self.loading_message = ""
+            return
+
+        self.video_path = None
+        self.fps = DEFAULT_IMAGE_FPS
+        self.frame_paths = sorted(TEMP_DIR.glob("frame_*.png"))
+        self.frames = [p.name for p in self.frame_paths]
+        self.current_index = 0
+        self.initialize_retarget_settings()
+        self.scroll_x = 0.0
+        self.scroll_velocity = 0.0
+        self.preview_zoom = 1.0
+        self.preview_offset = [0.0, 0.0]
+
+        self.full_cache.clear()
+        self.thumb_cache.clear()
+        self.large_thumb_cache.clear()
+        with self.wand_zone_lock:
+            self.wand_zone_cache.clear()
+            self.wand_preload_targets = []
+        self.base_thumb_sizes = []
+        self.large_thumb_sizes = []
+        self.prefix_positions = []
+        self.timeline_total_width = 0
+        self.preview_surface = None
+        self.preview_surface_key = None
+        self.needs_preview_refresh = True
+
+        self.prime_caches_near_current()
+        self.rebuild_timeline_metrics()
+        self.center_selected()
+        self.schedule_wand_zone_preload()
+        self.loading_message = ""
+        self.set_status(f"Opened image at {DEFAULT_IMAGE_FPS:g} FPS")
+
     def reload_video(self):
         if self.video_path is None:
             self.set_status("No source video to reload")
@@ -492,8 +711,10 @@ class FrameEditorApp:
         if not self.frame_paths:
             return None
         index = max(0, min(self.current_index, len(self.frame_paths) - 1))
-        with Image.open(self.frame_paths[index]) as image:
-            return image.size
+        image = self.open_image_copy(self.frame_paths[index], "RGBA", "read frame size")
+        if image is None:
+            return None
+        return image.size
 
     def initialize_retarget_settings(self):
         size = self.get_current_frame_size()
@@ -619,9 +840,12 @@ class FrameEditorApp:
                 popup.update_idletasks()
                 popup.update()
 
-                with Image.open(path) as image:
-                    image = image.convert("RGB").resize((width, height), Image.Resampling.LANCZOS)
-                    preview_frames.append(ImageTk.PhotoImage(image))
+                image = self.open_image_copy(path, "RGB", "open preview frame")
+                if image is None:
+                    close_preview()
+                    return
+                image = image.resize((width, height), Image.Resampling.LANCZOS)
+                preview_frames.append(ImageTk.PhotoImage(image))
         except MemoryError:
             close_preview()
             self.set_status("Preview too large to fit in memory")
@@ -664,6 +888,9 @@ class FrameEditorApp:
     def export_video(self):
         if not self.frames:
             return
+        ffmpeg = self.get_ffmpeg_tool("ffmpeg")
+        if not ffmpeg:
+            return
         save_path = filedialog.asksaveasfilename(
             title="Save video",
             defaultextension=".mp4",
@@ -675,30 +902,34 @@ class FrameEditorApp:
         temp_video = TEMP_DIR / "_video_only_export.mp4"
         width, height, output_fps = self.get_retarget_settings()
 
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-framerate",
-                str(output_fps),
-                "-i",
-                str(TEMP_DIR / "frame_%06d.png"),
-                "-vf",
-                f"scale={width}:{height}",
-                "-c:v",
-                "libx264",
-                "-pix_fmt",
-                "yuv420p",
-                str(temp_video),
-            ],
-            check=True,
-        )
+        try:
+            subprocess.run(
+                [
+                    ffmpeg,
+                    "-y",
+                    "-framerate",
+                    str(output_fps),
+                    "-i",
+                    str(TEMP_DIR / "frame_%06d.png"),
+                    "-vf",
+                    f"scale={width}:{height}",
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv420p",
+                    str(temp_video),
+                ],
+                check=True,
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            self.show_file_error("export video", temp_video, exc)
+            return
 
         if self.video_path is not None:
             try:
                 subprocess.run(
                     [
-                        "ffmpeg",
+                        ffmpeg,
                         "-y",
                         "-i",
                         str(temp_video),
@@ -719,14 +950,19 @@ class FrameEditorApp:
                 )
                 self.set_status("Exported video with original audio")
             except subprocess.CalledProcessError:
-                shutil.copy(temp_video, save_path)
+                if not self.copy_path_retry(temp_video, save_path, "save exported video"):
+                    return
                 self.set_status("Exported video only; audio copy failed")
         else:
-            shutil.copy(temp_video, save_path)
+            if not self.copy_path_retry(temp_video, save_path, "save exported video"):
+                return
             self.set_status("Exported video only")
 
     def export_high_quality_gif(self):
         if not self.frames:
+            return
+        ffmpeg = self.get_ffmpeg_tool("ffmpeg")
+        if not ffmpeg:
             return
         save_path = filedialog.asksaveasfilename(
             title="Save high quality GIF",
@@ -743,22 +979,26 @@ class FrameEditorApp:
             "[s0]palettegen=max_colors=256:reserve_transparent=1[p];"
             "[s1][p]paletteuse=dither=sierra2_4a:alpha_threshold=128"
         )
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-framerate",
-                str(output_fps),
-                "-i",
-                str(TEMP_DIR / "frame_%06d.png"),
-                "-filter_complex",
-                filter_graph,
-                "-loop",
-                "0",
-                save_path,
-            ],
-            check=True,
-        )
+        try:
+            subprocess.run(
+                [
+                    ffmpeg,
+                    "-y",
+                    "-framerate",
+                    str(output_fps),
+                    "-i",
+                    str(TEMP_DIR / "frame_%06d.png"),
+                    "-filter_complex",
+                    filter_graph,
+                    "-loop",
+                    "0",
+                    save_path,
+                ],
+                check=True,
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            self.show_file_error("export GIF", save_path, exc)
+            return
         self.set_status("Exported high quality GIF")
 
     # ---------- cache ----------
@@ -766,7 +1006,13 @@ class FrameEditorApp:
         surf = self.full_cache.get(index)
         if surf is not None:
             return surf
-        surf = pygame.image.load(str(self.frame_paths[index])).convert_alpha()
+        surf = self.retry_file_operation(
+            "load frame image",
+            lambda: pygame.image.load(str(self.frame_paths[index])).convert_alpha(),
+            self.frame_paths[index],
+        )
+        if surf is None:
+            return pygame.Surface((1, 1), pygame.SRCALPHA).convert_alpha()
         self.full_cache[index] = surf
         return surf
 
@@ -929,6 +1175,8 @@ class FrameEditorApp:
         self.prime_caches_near_current()
         self.center_selected()
         self.schedule_wand_zone_preload()
+        if self.color_popup is not None and self.color_popup.winfo_exists() and self.color_tool_refresh is not None:
+            self.color_tool_refresh()
 
     def refresh_preview_surface(self):
         if not self.frames:
@@ -976,6 +1224,82 @@ class FrameEditorApp:
         self.status_message = message
         self.status_until = pygame.time.get_ticks() + duration_ms
 
+    def show_file_error(self, action, path, exc):
+        target = f"\n\n{path}" if path is not None else ""
+        message = f"Could not {action}.{target}\n\n{exc}"
+        self.set_status(f"Could not {action}", 5000)
+        try:
+            messagebox.showerror("File Error", message, parent=self.tk_root)
+        except Exception:
+            pass
+
+    def release_file_caches(self):
+        self.full_cache.clear()
+        self.thumb_cache.clear()
+        self.large_thumb_cache.clear()
+        self.preview_surface = None
+        self.preview_surface_key = None
+        self.needs_preview_refresh = True
+        gc.collect()
+
+    def retry_file_operation(self, action, operation, path=None, show_error=True):
+        last_exc = None
+        for attempt in range(FILE_RETRY_COUNT):
+            try:
+                return operation()
+            except (OSError, PermissionError) as exc:
+                last_exc = exc
+                self.release_file_caches()
+                if attempt < FILE_RETRY_COUNT - 1:
+                    time.sleep(FILE_RETRY_DELAY * (attempt + 1))
+        if show_error and last_exc is not None:
+            self.show_file_error(action, path, last_exc)
+        return None
+
+    def open_image_copy(self, path, mode="RGBA", action="open image"):
+        def operation():
+            with Image.open(path) as image:
+                return image.convert(mode).copy() if mode else image.copy()
+
+        return self.retry_file_operation(action, operation, path)
+
+    def save_image_retry(self, image, path, action="save image"):
+        def operation():
+            image.save(path)
+            return True
+
+        return bool(self.retry_file_operation(action, operation, path))
+
+    def rename_path_retry(self, src, dst):
+        def operation():
+            src.rename(dst)
+            return True
+
+        return bool(self.retry_file_operation("rename frame file", operation, src))
+
+    def unlink_path_retry(self, path):
+        def operation():
+            path.unlink()
+            return True
+
+        return bool(self.retry_file_operation("delete frame file", operation, path))
+
+    def copy_path_retry(self, src, dst, action="copy file"):
+        def operation():
+            shutil.copy(src, dst)
+            return True
+
+        return bool(self.retry_file_operation(action, operation, src))
+
+    def handle_filesystem_exception(self, exc):
+        self.loading_message = ""
+        self.mask_dragging = False
+        self.wand_dragging = False
+        self.dragging_timeline = False
+        self.dragging_preview = False
+        self.release_file_caches()
+        self.show_file_error("access a file", None, exc)
+
     def invalidate_frame_cache(self, index=None):
         if index is None:
             self.full_cache.clear()
@@ -994,10 +1318,12 @@ class FrameEditorApp:
         self.needs_preview_refresh = True
 
     def save_edited_frame(self, index, image):
-        image.convert("RGBA").save(self.frame_paths[index])
+        if not self.save_image_retry(image.convert("RGBA"), self.frame_paths[index], "save frame"):
+            return False
         self.invalidate_frame_cache(index)
         if index == self.current_index:
             self.schedule_wand_zone_preload()
+        return True
 
     def draw_checkerboard(self, surface, rect, offset=(0, 0)):
         clip = surface.get_clip()
@@ -1031,7 +1357,7 @@ class FrameEditorApp:
         self.set_status(f"Background: {self.preview_background}")
 
     # ---------- color ----------
-    def apply_hue_saturation_to_image(self, image, hue_degrees, saturation_percent):
+    def apply_hue_saturation_to_image(self, image, hue_degrees, saturation_percent, brightness_percent=100):
         image = image.convert("RGBA")
         alpha = image.getchannel("A")
         hsv = image.convert("RGB").convert("HSV")
@@ -1043,6 +1369,9 @@ class FrameEditorApp:
         s = s.point(lambda value: max(0, min(255, int(value * sat_scale))))
 
         adjusted = Image.merge("HSV", (h, s, v)).convert("RGBA")
+        brightness_scale = max(0.0, float(brightness_percent) / 100.0)
+        adjusted_rgb = ImageEnhance.Brightness(adjusted.convert("RGB")).enhance(brightness_scale)
+        adjusted = adjusted_rgb.convert("RGBA")
         adjusted.putalpha(alpha)
         return adjusted
 
@@ -1183,8 +1512,7 @@ class FrameEditorApp:
         return self.histogram_match_image(source_image, reference_image)
 
     def get_selected_reference_image(self):
-        with Image.open(self.frame_paths[self.current_index]) as image:
-            return image.convert("RGB").copy()
+        return self.open_image_copy(self.frame_paths[self.current_index], "RGB", "open selected reference frame")
 
     def set_color_reference_from_frame(self, index=None):
         if not self.frames:
@@ -1194,8 +1522,9 @@ class FrameEditorApp:
         if index is None:
             index = self.current_index
 
-        with Image.open(self.frame_paths[index]) as image:
-            self.color_reference_image = image.convert("RGB").copy()
+        self.color_reference_image = self.open_image_copy(self.frame_paths[index], "RGB", "open color reference frame")
+        if self.color_reference_image is None:
+            return
         self.color_reference_label = f"Frame {index}"
         self.set_status(f"Color reference set from frame {index}")
 
@@ -1212,9 +1541,14 @@ class FrameEditorApp:
 
         try:
             reference = self.get_selected_reference_image()
-            with Image.open(self.frame_paths[index]) as image:
-                matched = self.apply_color_match_method(image, reference)
-            self.save_edited_frame(index, matched)
+            if reference is None:
+                return
+            image = self.open_image_copy(self.frame_paths[index], "RGBA", "open frame for color match")
+            if image is None:
+                return
+            matched = self.apply_color_match_method(image, reference)
+            if not self.save_edited_frame(index, matched):
+                return
             self.prime_caches_near_current()
             self.rebuild_timeline_metrics()
             self.set_status(f"Matched frame {index} to selected frame using {self.color_match_method}")
@@ -1230,21 +1564,87 @@ class FrameEditorApp:
             return
         self.match_frame_to_selected_reference(target_index)
 
+    def blend_selected_with_adjacent_frames(self, prev_weight=None, current_weight=None, next_weight=None):
+        if not self.frames:
+            return
+
+        prev_index = self.current_index - 1
+        next_index = self.current_index + 1
+        if prev_index < 0 and next_index >= len(self.frames):
+            self.set_status("No adjacent frames to blend")
+            return
+
+        prev_weight = self.color_blend_prev_weight if prev_weight is None else float(prev_weight)
+        current_weight = self.color_blend_current_weight if current_weight is None else float(current_weight)
+        next_weight = self.color_blend_next_weight if next_weight is None else float(next_weight)
+        if prev_index < 0:
+            prev_weight = 0.0
+        if next_index >= len(self.frames):
+            next_weight = 0.0
+
+        total_weight = prev_weight + current_weight + next_weight
+        if total_weight <= 0:
+            self.set_status("Blend weights must be above zero")
+            return
+
+        try:
+            import numpy as np
+        except ImportError:
+            self.set_status("Install numpy to use adjacent blending")
+            return
+
+        current = self.open_image_copy(self.frame_paths[self.current_index], "RGBA", "open current frame")
+        if current is None:
+            return
+        alpha = current.getchannel("A")
+        current_rgb = current.convert("RGB")
+        accum = np.asarray(current_rgb, dtype=np.float32) * current_weight
+
+        if prev_weight > 0:
+            prev_reference = self.open_image_copy(self.frame_paths[prev_index], "RGB", "open previous frame")
+            if prev_reference is None:
+                return
+            prev_matched = self.apply_color_match_method(current_rgb, prev_reference).convert("RGB")
+            accum += np.asarray(prev_matched, dtype=np.float32) * prev_weight
+
+        if next_weight > 0:
+            next_reference = self.open_image_copy(self.frame_paths[next_index], "RGB", "open next frame")
+            if next_reference is None:
+                return
+            next_matched = self.apply_color_match_method(current_rgb, next_reference).convert("RGB")
+            accum += np.asarray(next_matched, dtype=np.float32) * next_weight
+
+        blended = np.clip(accum / total_weight, 0, 255).astype("uint8")
+        result = Image.fromarray(blended, "RGB").convert("RGBA")
+        result.putalpha(alpha)
+        if not self.save_edited_frame(self.current_index, result):
+            return
+        self.prime_caches_near_current()
+        self.rebuild_timeline_metrics()
+        self.set_status(f"Blended selected frame {prev_weight:.0f}/{current_weight:.0f}/{next_weight:.0f}")
+
     def match_video_to_selected_reference(self):
         if not self.frames:
             return
 
         reference_index = self.current_index
         reference = self.get_selected_reference_image()
+        if reference is None:
+            return
         self.loading_message = "Color matching video to selected frame..."
         self.force_redraw()
         try:
             for i, path in enumerate(self.frame_paths):
                 if i == reference_index:
                     continue
-                with Image.open(path) as image:
-                    matched = self.apply_color_match_method(image, reference)
-                matched.convert("RGBA").save(path)
+                image = self.open_image_copy(path, "RGBA", "open frame for color match")
+                if image is None:
+                    self.loading_message = ""
+                    return
+                matched = self.apply_color_match_method(image, reference)
+                if not self.save_image_retry(matched.convert("RGBA"), path, "save color matched frame"):
+                    self.loading_message = ""
+                    return
         except RuntimeError as exc:
             self.loading_message = ""
             self.set_status(str(exc))
@@ -1276,64 +1676,124 @@ class FrameEditorApp:
         popup.resizable(False, False)
         self.color_popup = popup
 
-        with Image.open(self.frame_paths[self.current_index]) as image:
-            base_image = image.convert("RGB").copy()
+        base_image = self.open_image_copy(self.frame_paths[self.current_index], "RGBA", "open color tool frame")
+        if base_image is None:
+            self.color_popup = None
+            popup.destroy()
+            return
 
         main = Frame(popup, padx=14, pady=12)
         main.pack()
 
         preview_frame = Frame(main)
-        preview_frame.grid(row=0, column=0, columnspan=3, sticky="nsew")
+        preview_frame.grid(row=0, column=0, columnspan=4, sticky="nsew")
 
         wheel_image = self.make_color_wheel_image()
         self.color_wheel_photo = ImageTk.PhotoImage(wheel_image)
         wheel_label = Label(preview_frame, image=self.color_wheel_photo, cursor="crosshair")
         wheel_label.grid(row=0, column=0, padx=(0, 14))
 
+        prev_preview = Label(preview_frame, bg="black")
+        prev_preview.grid(row=0, column=1, padx=(0, 8))
         frame_preview = Label(preview_frame, bg="black")
-        frame_preview.grid(row=0, column=1)
+        frame_preview.grid(row=0, column=2, padx=(0, 8))
+        next_preview = Label(preview_frame, bg="black")
+        next_preview.grid(row=0, column=3)
         ref_var = StringVar(value=f"Selected frame {self.current_index} is the reference")
-        Label(main, textvariable=ref_var, anchor="w").grid(row=1, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        Label(main, textvariable=ref_var, anchor="w").grid(row=1, column=0, columnspan=4, sticky="ew", pady=(10, 0))
 
         Label(main, text="Method").grid(row=2, column=0, sticky="w", pady=(10, 0))
         method_var = StringVar(value=self.color_match_method)
         method_menu = OptionMenu(main, method_var, "HM", "Reinhard", "MKL", "MVGD", "HM-MVGD-HM", "HM-MKL-HM")
-        method_menu.grid(row=2, column=1, columnspan=2, sticky="ew", pady=(10, 0))
+        method_menu.grid(row=2, column=1, columnspan=3, sticky="ew", pady=(10, 0))
 
         Label(main, text="Hue").grid(row=3, column=0, sticky="w", pady=(10, 0))
         hue_scale = Scale(main, from_=-180, to=180, orient=HORIZONTAL, length=320, resolution=1)
-        hue_scale.grid(row=3, column=1, columnspan=2, sticky="ew", pady=(10, 0))
+        hue_scale.grid(row=3, column=1, columnspan=3, sticky="ew", pady=(10, 0))
 
         Label(main, text="Saturation").grid(row=4, column=0, sticky="w")
         sat_scale = Scale(main, from_=0, to=200, orient=HORIZONTAL, length=320, resolution=1)
         sat_scale.set(100)
-        sat_scale.grid(row=4, column=1, columnspan=2, sticky="ew")
+        sat_scale.grid(row=4, column=1, columnspan=3, sticky="ew")
+
+        Label(main, text="Brightness").grid(row=5, column=0, sticky="w")
+        brightness_scale = Scale(main, from_=0, to=200, orient=HORIZONTAL, length=320, resolution=1)
+        brightness_scale.set(100)
+        brightness_scale.grid(row=5, column=1, columnspan=3, sticky="ew")
+
+        weights_frame = Frame(main)
+        weights_frame.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        prev_weight_var = StringVar(value=f"{self.color_blend_prev_weight:g}")
+        current_weight_var = StringVar(value=f"{self.color_blend_current_weight:g}")
+        next_weight_var = StringVar(value=f"{self.color_blend_next_weight:g}")
+        Label(weights_frame, text="Blend Prev").pack(side="left")
+        Entry(weights_frame, textvariable=prev_weight_var, width=5).pack(side="left", padx=(4, 10))
+        Label(weights_frame, text="Current").pack(side="left")
+        Entry(weights_frame, textvariable=current_weight_var, width=5).pack(side="left", padx=(4, 10))
+        Label(weights_frame, text="Next").pack(side="left")
+        Entry(weights_frame, textvariable=next_weight_var, width=5).pack(side="left", padx=(4, 0))
 
         preview_state = {"photo": None}
 
         def make_adjusted():
-            return self.apply_hue_saturation_to_image(base_image, hue_scale.get(), sat_scale.get())
+            return self.apply_hue_saturation_to_image(base_image, hue_scale.get(), sat_scale.get(), brightness_scale.get())
+
+        def make_preview_photo(image, size=(220, 160)):
+            preview = image.convert("RGBA").copy()
+            preview.thumbnail(size, Image.Resampling.LANCZOS)
+            return ImageTk.PhotoImage(preview)
 
         def update_color_preview(_value=None):
-            adjusted = make_adjusted().convert("RGB")
-            preview = adjusted.copy()
-            preview.thumbnail((360, 260), Image.Resampling.LANCZOS)
-            photo = ImageTk.PhotoImage(preview)
+            adjusted = make_adjusted()
+            photo = make_preview_photo(adjusted, (300, 220))
             frame_preview.configure(image=photo)
             frame_preview.image = photo
             preview_state["photo"] = photo
 
+        def update_reference_previews():
+            prev_index = self.current_index - 1
+            next_index = self.current_index + 1
+            if prev_index >= 0:
+                image = self.open_image_copy(self.frame_paths[prev_index], "RGBA", "open previous color reference")
+                if image is None:
+                    return
+                prev_photo = make_preview_photo(image)
+                prev_preview.configure(image=prev_photo, text="", width=0, height=0)
+                prev_preview.image = prev_photo
+            else:
+                prev_preview.configure(image="", text="No previous", width=20, height=8, fg="white")
+                prev_preview.image = None
+
+            if next_index < len(self.frame_paths):
+                image = self.open_image_copy(self.frame_paths[next_index], "RGBA", "open next color reference")
+                if image is None:
+                    return
+                next_photo = make_preview_photo(image)
+                next_preview.configure(image=next_photo, text="", width=0, height=0)
+                next_preview.image = next_photo
+            else:
+                next_preview.configure(image="", text="No next", width=20, height=8, fg="white")
+                next_preview.image = None
+
         def apply_to_current():
             adjusted = make_adjusted()
-            self.save_edited_frame(self.current_index, adjusted)
+            if not self.save_edited_frame(self.current_index, adjusted):
+                return
             self.prime_caches_near_current()
             self.rebuild_timeline_metrics()
             ref_var.set(f"Selected frame {self.current_index} is the reference")
             self.set_status(f"Applied color adjustment to selected frame {self.current_index}")
 
-        def match_current():
+        def blend_adjacent():
             self.color_match_method = method_var.get()
-            self.match_next_frame_to_selected_reference()
+            try:
+                self.color_blend_prev_weight = float(prev_weight_var.get())
+                self.color_blend_current_weight = float(current_weight_var.get())
+                self.color_blend_next_weight = float(next_weight_var.get())
+            except ValueError:
+                self.set_status("Blend weights must be numbers")
+                return
+            self.blend_selected_with_adjacent_frames()
 
         def match_all():
             self.color_match_method = method_var.get()
@@ -1341,6 +1801,19 @@ class FrameEditorApp:
 
         def update_method(*_args):
             self.color_match_method = method_var.get()
+
+        def refresh_for_selected_frame():
+            nonlocal base_image
+            image = self.open_image_copy(self.frame_paths[self.current_index], "RGBA", "open color tool frame")
+            if image is None:
+                return
+            base_image = image
+            hue_scale.set(0)
+            sat_scale.set(100)
+            brightness_scale.set(100)
+            ref_var.set(f"Selected frame {self.current_index} is the reference")
+            update_reference_previews()
+            update_color_preview()
 
         def pick_from_wheel(event):
             import math
@@ -1361,23 +1834,27 @@ class FrameEditorApp:
         def close_popup():
             if self.color_popup is popup:
                 self.color_popup = None
+                self.color_tool_refresh = None
             popup.destroy()
 
         hue_scale.configure(command=update_color_preview)
         sat_scale.configure(command=update_color_preview)
+        brightness_scale.configure(command=update_color_preview)
         method_var.trace_add("write", update_method)
         wheel_label.bind("<Button-1>", pick_from_wheel)
         wheel_label.bind("<B1-Motion>", pick_from_wheel)
 
         buttons = Frame(main)
-        buttons.grid(row=5, column=0, columnspan=3, sticky="e", pady=(12, 0))
+        buttons.grid(row=7, column=0, columnspan=4, sticky="e", pady=(12, 0))
         Button(buttons, text="Apply To Selected", command=apply_to_current).pack(side="left", padx=(0, 8))
-        Button(buttons, text="Match Next Frame", command=match_current).pack(side="left", padx=(0, 8))
+        Button(buttons, text="Blend Adjacent", command=blend_adjacent).pack(side="left", padx=(0, 8))
         Button(buttons, text="Match Whole Video", command=match_all).pack(side="left", padx=(0, 8))
         Button(buttons, text="Close", command=close_popup).pack(side="left")
 
         popup.protocol("WM_DELETE_WINDOW", close_popup)
         popup.bind("<Escape>", lambda _event: close_popup())
+        self.color_tool_refresh = refresh_for_selected_frame
+        update_reference_previews()
         update_color_preview()
 
     # ---------- background / mask ----------
@@ -1450,7 +1927,9 @@ class FrameEditorApp:
             return
 
         x, y = pos
-        image = Image.open(self.frame_paths[self.current_index]).convert("RGBA")
+        image = self.open_image_copy(self.frame_paths[self.current_index], "RGBA", "open frame for mask edit")
+        if image is None:
+            return
         alpha = image.getchannel("A")
         try:
             from PIL import ImageDraw
@@ -1459,7 +1938,8 @@ class FrameEditorApp:
             fill = 255 if self.mask_paint_mode == "restore" else 0
             draw.ellipse((x - r, y - r, x + r, y + r), fill=fill)
             image.putalpha(alpha)
-            self.save_edited_frame(self.current_index, image)
+            if not self.save_edited_frame(self.current_index, image):
+                return
         finally:
             image.close()
 
@@ -1487,8 +1967,10 @@ class FrameEditorApp:
         except ImportError:
             raise RuntimeError("Install numpy to use wand selection")
 
-        with Image.open(self.frame_paths[index]) as image:
-            rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+        image = self.open_image_copy(self.frame_paths[index], "RGB", "open frame for wand zones")
+        if image is None:
+            raise RuntimeError("Could not open frame for wand zones")
+        rgb = np.asarray(image, dtype=np.uint8)
 
         labels, component_colors = self.build_wand_components(rgb, np)
         component_id = len(component_colors)
@@ -1695,7 +2177,9 @@ class FrameEditorApp:
             self.set_status("Install numpy to use wand selection")
             return
 
-        image = Image.open(self.frame_paths[self.current_index]).convert("RGBA")
+        image = self.open_image_copy(self.frame_paths[self.current_index], "RGBA", "open frame for wand edit")
+        if image is None:
+            return
         try:
             alpha = np.asarray(image.getchannel("A"), dtype=np.uint8).copy()
             if alpha.shape != self.wand_selection.shape:
@@ -1703,7 +2187,8 @@ class FrameEditorApp:
                 return
             alpha[self.wand_selection] = alpha_value
             image.putalpha(Image.fromarray(alpha, "L"))
-            self.save_edited_frame(self.current_index, image)
+            if not self.save_edited_frame(self.current_index, image):
+                return
             self.prime_caches_near_current()
             self.rebuild_timeline_metrics()
             verb = "Restored" if alpha_value else "Erased"
@@ -1714,10 +2199,13 @@ class FrameEditorApp:
     def clear_current_mask(self):
         if not self.frames:
             return
-        image = Image.open(self.frame_paths[self.current_index]).convert("RGBA")
+        image = self.open_image_copy(self.frame_paths[self.current_index], "RGBA", "open current mask")
+        if image is None:
+            return
         try:
             image.putalpha(0)
-            self.save_edited_frame(self.current_index, image)
+            if not self.save_edited_frame(self.current_index, image):
+                return
             self.set_status("Erased current frame mask")
         finally:
             image.close()
@@ -1725,30 +2213,49 @@ class FrameEditorApp:
     def fill_current_mask(self):
         if not self.frames:
             return
-        image = Image.open(self.frame_paths[self.current_index]).convert("RGBA")
+        image = self.open_image_copy(self.frame_paths[self.current_index], "RGBA", "open current mask")
+        if image is None:
+            return
         try:
             image.putalpha(255)
-            self.save_edited_frame(self.current_index, image)
+            if not self.save_edited_frame(self.current_index, image):
+                return
             self.set_status("Filled current frame mask")
         finally:
             image.close()
 
     def remove_background_from_frame(self, index):
         try:
-            from rembg import remove
-        except ImportError:
-            raise RuntimeError("Install rembg to use background removal")
+            rembg_module = importlib.import_module("rembg")
+            remove = rembg_module.remove
+            new_session = rembg_module.new_session
+        except (ImportError, SystemExit):
+            raise RuntimeError("Install rembg with CPU support to use background removal")
 
-        with Image.open(self.frame_paths[index]) as image:
-            original = image.convert("RGBA")
-            result = remove(original)
+        session = self.rembg_sessions.get(self.rembg_model)
+        if session is None:
+            session = new_session(self.rembg_model)
+            self.rembg_sessions[self.rembg_model] = session
+
+        original = self.open_image_copy(self.frame_paths[index], "RGBA", "open frame for background removal")
+        if original is None:
+            raise RuntimeError("Could not open frame for background removal")
+        result = remove(
+            original,
+            session=session,
+            alpha_matting=self.rembg_alpha_matting,
+            alpha_matting_foreground_threshold=self.rembg_fg_threshold,
+            alpha_matting_background_threshold=self.rembg_bg_threshold,
+            alpha_matting_erode_size=self.rembg_erode_size,
+        )
         if isinstance(result, Image.Image):
             removed = result.convert("RGBA")
         else:
             removed = Image.open(io.BytesIO(result)).convert("RGBA")
 
         original.putalpha(removed.getchannel("A"))
-        original.save(self.frame_paths[index])
+        if not self.save_image_retry(original, self.frame_paths[index], "save background removal result"):
+            raise RuntimeError("Could not save background removal result")
 
     def remove_background_current_frame(self):
         if not self.frames:
@@ -1789,6 +2296,91 @@ class FrameEditorApp:
         self.rebuild_timeline_metrics()
         self.set_status("Removed backgrounds; enable Mask Edit to restore areas", 4000)
 
+    def open_rembg_settings(self):
+        if self.rembg_settings_popup is not None and self.rembg_settings_popup.winfo_exists():
+            self.rembg_settings_popup.lift()
+            return
+
+        popup = Toplevel(self.tk_root)
+        popup.title("Background Removal Settings")
+        popup.resizable(False, False)
+        self.rembg_settings_popup = popup
+
+        main = Frame(popup, padx=14, pady=12)
+        main.pack()
+
+        model_var = StringVar(value=self.rembg_model)
+        matting_var = StringVar(value="On" if self.rembg_alpha_matting else "Off")
+        fg_var = StringVar(value=str(self.rembg_fg_threshold))
+        bg_var = StringVar(value=str(self.rembg_bg_threshold))
+        erode_var = StringVar(value=str(self.rembg_erode_size))
+        error_var = StringVar(value="")
+
+        Label(main, text="Model").grid(row=0, column=0, sticky="w", pady=4)
+        OptionMenu(
+            main,
+            model_var,
+            "isnet-anime",
+            "isnet-general-use",
+            "birefnet-general",
+            "birefnet-general-lite",
+            "u2net",
+            "u2netp",
+            "silueta",
+        ).grid(row=0, column=1, sticky="ew", padx=(12, 0), pady=4)
+
+        Label(main, text="Alpha Matting").grid(row=1, column=0, sticky="w", pady=4)
+        OptionMenu(main, matting_var, "On", "Off").grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=4)
+
+        def add_entry(row, label, variable):
+            Label(main, text=label).grid(row=row, column=0, sticky="w", pady=4)
+            entry = Entry(main, textvariable=variable, width=12)
+            entry.grid(row=row, column=1, sticky="ew", padx=(12, 0), pady=4)
+            return entry
+
+        add_entry(2, "Foreground Threshold", fg_var)
+        add_entry(3, "Background Threshold", bg_var)
+        add_entry(4, "Erode Size", erode_var)
+        Label(main, textvariable=error_var, fg="red").grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        buttons = Frame(main)
+        buttons.grid(row=6, column=0, columnspan=2, sticky="e", pady=(12, 0))
+
+        def close_popup():
+            if self.rembg_settings_popup is popup:
+                self.rembg_settings_popup = None
+            popup.destroy()
+
+        def apply_settings():
+            try:
+                fg = int(fg_var.get())
+                bg = int(bg_var.get())
+                erode = int(erode_var.get())
+            except ValueError:
+                error_var.set("Thresholds and erode size must be whole numbers.")
+                return
+
+            if not (0 <= bg <= 255 and 0 <= fg <= 255 and erode >= 0):
+                error_var.set("Thresholds must be 0-255; erode size must be 0+.")
+                return
+
+            old_model = self.rembg_model
+            self.rembg_model = model_var.get()
+            self.rembg_alpha_matting = matting_var.get() == "On"
+            self.rembg_fg_threshold = fg
+            self.rembg_bg_threshold = bg
+            self.rembg_erode_size = erode
+            if old_model != self.rembg_model:
+                self.rembg_sessions.pop(old_model, None)
+            self.set_status(f"RMBG: {self.rembg_model}, matting {matting_var.get()}")
+            close_popup()
+
+        Button(buttons, text="Cancel", command=close_popup).pack(side="right", padx=(8, 0))
+        Button(buttons, text="Apply", command=apply_settings).pack(side="right")
+        popup.protocol("WM_DELETE_WINDOW", close_popup)
+        popup.bind("<Return>", lambda _event: apply_settings())
+        popup.bind("<Escape>", lambda _event: close_popup())
+
     # ---------- copy / paste ----------
     def copy_frame(self):
         if not self.frames:
@@ -1796,8 +2388,11 @@ class FrameEditorApp:
 
         src = self.frame_paths[self.current_index]
         copied = Path("copied_frame.png")
-        with Image.open(src) as image:
-            image.convert("RGBA").save(copied)
+        image = self.open_image_copy(src, "RGBA", "open frame to copy")
+        if image is None:
+            return
+        if not self.save_image_retry(image, copied, "copy frame"):
+            return
 
         if set_png_clipboard_from_path(copied):
             self.set_status("Copied alpha image to clipboard")
@@ -1815,8 +2410,10 @@ class FrameEditorApp:
         dst = self.frame_paths[self.current_index]
         current_alpha = None
         if dst.exists():
-            with Image.open(dst) as current:
-                current_alpha = current.convert("RGBA").getchannel("A")
+            current = self.open_image_copy(dst, "RGBA", "open current frame")
+            if current is None:
+                return
+            current_alpha = current.getchannel("A")
 
         clipboard_image = get_image_from_clipboard()
         if clipboard_image is not None:
@@ -1826,7 +2423,8 @@ class FrameEditorApp:
                 if pasted.size != current_alpha.size:
                     pasted = pasted.resize(current_alpha.size, Image.Resampling.LANCZOS)
                 pasted.putalpha(current_alpha)
-            pasted.save(dst)
+            if not self.save_image_retry(pasted, dst, "paste frame"):
+                return
         else:
             src = None
             clipboard_paths = [Path(p) for p in get_file_clipboard_paths()]
@@ -1843,45 +2441,47 @@ class FrameEditorApp:
             if src is None:
                 return
 
-            with Image.open(src) as image:
-                pasted = image.convert("RGBA")
-                has_pasted_alpha = "A" in image.getbands()
-                if current_alpha is not None and not has_pasted_alpha:
-                    if pasted.size != current_alpha.size:
-                        pasted = pasted.resize(current_alpha.size, Image.Resampling.LANCZOS)
-                    pasted.putalpha(current_alpha)
-                pasted.save(dst)
+            def read_bands():
+                with Image.open(src) as source_image:
+                    return source_image.getbands()
+
+            bands = self.retry_file_operation("inspect pasted image", read_bands, src)
+            if bands is None:
+                return
+            has_pasted_alpha = "A" in bands
+            pasted = self.open_image_copy(src, "RGBA", "open pasted image")
+            if pasted is None:
+                return
+            if current_alpha is not None and not has_pasted_alpha:
+                if pasted.size != current_alpha.size:
+                    pasted = pasted.resize(current_alpha.size, Image.Resampling.LANCZOS)
+                pasted.putalpha(current_alpha)
+            if not self.save_image_retry(pasted, dst, "paste frame"):
+                return
 
         self.invalidate_frame_cache(self.current_index)
         self.prime_caches_near_current()
         self.rebuild_timeline_metrics()
 
-    def delete_current_frame(self):
-        if not self.frames:
-            return
-
-        delete_index = self.current_index
-        delete_path = self.frame_paths[delete_index]
-        try:
-            delete_path.unlink()
-        except OSError:
-            self.set_status("Could not delete current frame")
-            return
-
-        remaining_paths = [path for i, path in enumerate(self.frame_paths) if i != delete_index]
+    def renumber_frame_files(self):
+        self.release_file_caches()
+        existing = sorted(TEMP_DIR.glob("frame_*.png"))
         temp_paths = []
-        for i, path in enumerate(remaining_paths):
+        for i, path in enumerate(existing):
             temp_path = TEMP_DIR / f"_renumber_{i:06d}.png"
-            path.rename(temp_path)
+            if not self.rename_path_retry(path, temp_path):
+                return False
             temp_paths.append(temp_path)
 
         for i, path in enumerate(temp_paths, start=1):
-            path.rename(TEMP_DIR / f"frame_{i:06d}.png")
+            if not self.rename_path_retry(path, TEMP_DIR / f"frame_{i:06d}.png"):
+                return False
 
         self.frame_paths = sorted(TEMP_DIR.glob("frame_*.png"))
         self.frames = [p.name for p in self.frame_paths]
-        self.current_index = max(0, min(delete_index, len(self.frames) - 1))
+        return True
 
+    def reset_after_frame_list_change(self):
         self.full_cache.clear()
         self.thumb_cache.clear()
         self.large_thumb_cache.clear()
@@ -1895,11 +2495,137 @@ class FrameEditorApp:
         self.preview_surface = None
         self.preview_surface_key = None
         self.needs_preview_refresh = True
+        self.prime_caches_near_current()
+        self.rebuild_timeline_metrics()
+        self.center_selected()
+
+    def export_current_frame(self):
+        if not self.frames:
+            return
+        save_path = filedialog.asksaveasfilename(
+            title="Export current frame",
+            defaultextension=".png",
+            filetypes=[("PNG Image", "*.png")],
+        )
+        if not save_path:
+            return
+        image = self.open_image_copy(self.frame_paths[self.current_index], "RGBA", "open current frame")
+        if image is None:
+            return
+        if not self.save_image_retry(image, save_path, "export current frame"):
+            return
+        self.set_status("Exported current frame")
+
+    def resize_image_for_append(self, image, target_size, mode):
+        target_w, target_h = target_size
+        if mode == "Stretch":
+            return image.resize(target_size, Image.Resampling.LANCZOS)
+
+        if mode == "Scale To Fit":
+            result = Image.new("RGBA", target_size, (0, 0, 0, 0))
+            copy = image.copy()
+            copy.thumbnail(target_size, Image.Resampling.LANCZOS)
+            x = (target_w - copy.width) // 2
+            y = (target_h - copy.height) // 2
+            result.alpha_composite(copy, (x, y))
+            return result
+
+        if mode == "Center Crop":
+            scale = max(target_w / image.width, target_h / image.height)
+            size = (max(1, int(image.width * scale)), max(1, int(image.height * scale)))
+            copy = image.resize(size, Image.Resampling.LANCZOS)
+            left = max(0, (copy.width - target_w) // 2)
+            top = max(0, (copy.height - target_h) // 2)
+            return copy.crop((left, top, left + target_w, top + target_h))
+
+        return image
+
+    def ask_append_resize_mode(self, source_size, target_size):
+        popup = Toplevel(self.tk_root)
+        popup.title("Append Frame Size")
+        popup.resizable(False, False)
+        choice = {"value": None}
+
+        main = Frame(popup, padx=14, pady=12)
+        main.pack()
+        Label(main, text=f"Image is {source_size[0]}x{source_size[1]}; video is {target_size[0]}x{target_size[1]}.").pack(anchor="w")
+        Label(main, text="Choose how to resize the appended frame.").pack(anchor="w", pady=(4, 12))
+
+        def choose(value):
+            choice["value"] = value
+            popup.destroy()
+
+        buttons = Frame(main)
+        buttons.pack(anchor="e")
+        for label in ("Scale To Fit", "Center Crop", "Stretch", "Cancel"):
+            Button(buttons, text=label, command=lambda value=label: choose(value)).pack(side="left", padx=(0, 8))
+
+        popup.protocol("WM_DELETE_WINDOW", lambda: choose("Cancel"))
+        popup.grab_set()
+        self.tk_root.wait_window(popup)
+        return choice["value"]
+
+    def append_frame_after_current(self):
+        if not self.frames:
+            return
+        path = filedialog.askopenfilename(
+            title="Append image frame",
+            filetypes=[("Image Files", " ".join(f"*{ext}" for ext in sorted(SUPPORTED_IMAGE_TYPES)))],
+        )
+        if not path:
+            return
+
+        current = self.open_image_copy(self.frame_paths[self.current_index], "RGBA", "open current frame")
+        if current is None:
+            return
+        target_size = current.size
+        image = self.open_image_copy(path, "RGBA", "open appended image")
+        if image is None:
+            return
+
+        if image.size != target_size:
+            mode = self.ask_append_resize_mode(image.size, target_size)
+            if mode in (None, "Cancel"):
+                return
+            image = self.resize_image_for_append(image, target_size, mode)
+
+        insert_index = self.current_index + 1
+        temp_insert = TEMP_DIR / "_insert_frame.png"
+        if not self.save_image_retry(image, temp_insert, "save inserted frame"):
+            return
+
+        self.release_file_caches()
+        for i in range(len(self.frame_paths), insert_index, -1):
+            src = TEMP_DIR / f"frame_{i:06d}.png"
+            dst = TEMP_DIR / f"frame_{i + 1:06d}.png"
+            if src.exists():
+                if not self.rename_path_retry(src, dst):
+                    return
+
+        if not self.rename_path_retry(temp_insert, TEMP_DIR / f"frame_{insert_index + 1:06d}.png"):
+            return
+        if not self.renumber_frame_files():
+            return
+        self.current_index = insert_index
+        self.reset_after_frame_list_change()
+        self.set_status("Appended frame")
+
+    def delete_current_frame(self):
+        if not self.frames:
+            return
+
+        delete_index = self.current_index
+        delete_path = self.frame_paths[delete_index]
+        self.release_file_caches()
+        if not self.unlink_path_retry(delete_path):
+            return
+
+        if not self.renumber_frame_files():
+            return
+        self.current_index = max(0, min(delete_index, len(self.frames) - 1))
 
         if self.frames:
-            self.prime_caches_near_current()
-            self.rebuild_timeline_metrics()
-            self.center_selected()
+            self.reset_after_frame_list_change()
             self.set_status("Deleted current frame")
         else:
             self.preview_zoom = 1.0
@@ -1934,6 +2660,8 @@ class FrameEditorApp:
         return [
             ("Copy Current Frame", "C", self.copy_frame, bool(self.frames)),
             ("Paste Over Current Frame", "V", self.paste_frame, bool(self.frames)),
+            ("Append Frame After Current...", "", self.append_frame_after_current, bool(self.frames)),
+            ("Export Current Frame...", "", self.export_current_frame, bool(self.frames)),
             ("Delete Current Frame", "Del", self.delete_current_frame, bool(self.frames)),
             ("First Frame", "Home", lambda: self.set_current_index(0), bool(self.frames)),
             ("Last Frame", "End", lambda: self.set_current_index(len(self.frames) - 1), bool(self.frames)),
@@ -1943,7 +2671,7 @@ class FrameEditorApp:
     def get_color_menu_items(self):
         return [
             ("Color Tools...", "H", self.open_color_tools, bool(self.frames)),
-            ("Match Next Frame To Selected", "", self.match_next_frame_to_selected_reference, bool(self.frames)),
+            ("Blend Selected With Adjacent", "", self.blend_selected_with_adjacent_frames, bool(self.frames)),
             ("Match Whole Video To Selected", "", self.match_video_to_selected_reference, bool(self.frames)),
         ]
 
@@ -1958,6 +2686,7 @@ class FrameEditorApp:
             ("Brush Erases Image", "", self.set_mask_erase_mode, bool(self.frames)),
             ("Fill Current Mask", "", self.fill_current_mask, bool(self.frames)),
             ("Erase Current Mask", "", self.clear_current_mask, bool(self.frames)),
+            ("RMBG Settings...", "", self.open_rembg_settings, True),
             ("Remove BG Current", "", self.remove_background_current_frame, bool(self.frames)),
             ("Remove BG Whole Video", "", self.remove_background_whole_video, bool(self.frames)),
         ]
@@ -2017,8 +2746,10 @@ class FrameEditorApp:
         path = Path(file_path)
         if path.suffix.lower() in SUPPORTED_VIDEO_EXTS:
             self.open_video_path(path)
+        elif path.suffix.lower() in SUPPORTED_IMAGE_TYPES:
+            self.open_image_path(path)
         else:
-            self.set_status("Drop a supported video or animation file")
+            self.set_status("Drop a supported video, animation, or image file")
 
     # ---------- input ----------
     def handle_mouse_button_down(self, event):
@@ -2311,7 +3042,7 @@ class FrameEditorApp:
         pygame.draw.rect(self.screen, (60, 60, 60), rect, 1)
 
         if not self.frames:
-            loading_text = self.loading_message if self.loading_message else "Use File > Open Video or drop a video here"
+            loading_text = self.loading_message if self.loading_message else "Use File > Open Video or drop a video/image here"
             msg = self.font.render(loading_text, True, TEXT)
             self.screen.blit(msg, msg.get_rect(center=rect.center))
             return
@@ -2442,25 +3173,28 @@ class FrameEditorApp:
     def run(self):
         while True:
             for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    pygame.quit()
-                    return
-                elif event.type == pygame.VIDEORESIZE:
-                    self.screen = pygame.display.set_mode(event.size, pygame.RESIZABLE)
-                    self.clamp_preview_offset()
-                    self.needs_preview_refresh = True
-                elif event.type == pygame.MOUSEBUTTONDOWN:
-                    self.handle_mouse_button_down(event)
-                elif event.type == pygame.MOUSEBUTTONUP:
-                    self.handle_mouse_button_up(event)
-                elif event.type == pygame.MOUSEMOTION:
-                    self.handle_mouse_motion(event)
-                elif event.type == pygame.KEYDOWN:
-                    self.handle_keydown(event)
-                elif event.type == pygame.KEYUP:
-                    self.handle_keyup(event)
-                elif event.type == pygame.DROPFILE:
-                    self.handle_dropfile(event.file)
+                try:
+                    if event.type == pygame.QUIT:
+                        pygame.quit()
+                        return
+                    elif event.type == pygame.VIDEORESIZE:
+                        self.screen = pygame.display.set_mode(event.size, pygame.RESIZABLE)
+                        self.clamp_preview_offset()
+                        self.needs_preview_refresh = True
+                    elif event.type == pygame.MOUSEBUTTONDOWN:
+                        self.handle_mouse_button_down(event)
+                    elif event.type == pygame.MOUSEBUTTONUP:
+                        self.handle_mouse_button_up(event)
+                    elif event.type == pygame.MOUSEMOTION:
+                        self.handle_mouse_motion(event)
+                    elif event.type == pygame.KEYDOWN:
+                        self.handle_keydown(event)
+                    elif event.type == pygame.KEYUP:
+                        self.handle_keyup(event)
+                    elif event.type == pygame.DROPFILE:
+                        self.handle_dropfile(event.file)
+                except (OSError, PermissionError) as exc:
+                    self.handle_filesystem_exception(exc)
 
             try:
                 self.tk_root.update_idletasks()
@@ -2468,14 +3202,17 @@ class FrameEditorApp:
             except Exception:
                 pass
 
-            self.update()
-            self.screen.fill(BG)
-            self.draw_top_bar()
-            self.draw_preview()
-            self.draw_timeline()
-            if self.active_menu is not None:
-                self.draw_active_menu()
-            pygame.display.flip()
+            try:
+                self.update()
+                self.screen.fill(BG)
+                self.draw_top_bar()
+                self.draw_preview()
+                self.draw_timeline()
+                if self.active_menu is not None:
+                    self.draw_active_menu()
+                pygame.display.flip()
+            except (OSError, PermissionError) as exc:
+                self.handle_filesystem_exception(exc)
             self.clock.tick(60)
 
 
