@@ -362,6 +362,9 @@ class FrameEditorApp:
         self.active_menu = None
         self.menu_rects = {}
         self.color_popup = None
+        self.color_range_popup = None
+        self.magic_outline_popup = None
+        self.color_range_image_sampler = None
         self.color_reference_image = None
         self.color_reference_label = ""
         self.color_wheel_photo = None
@@ -434,6 +437,18 @@ class FrameEditorApp:
                 pass
         self.clear_active_tool("color")
 
+    def close_color_range_tools(self):
+        popup = self.color_range_popup
+        self.color_range_popup = None
+        self.color_range_image_sampler = None
+        if popup is not None:
+            try:
+                if popup.winfo_exists():
+                    popup.destroy()
+            except Exception:
+                pass
+        self.clear_active_tool("color_range")
+
     def close_rembg_settings(self):
         popup = self.rembg_settings_popup
         self.rembg_settings_popup = None
@@ -444,6 +459,17 @@ class FrameEditorApp:
             except Exception:
                 pass
         self.clear_active_tool("rembg_settings")
+
+    def close_magic_outline_tools(self):
+        popup = self.magic_outline_popup
+        self.magic_outline_popup = None
+        if popup is not None:
+            try:
+                if popup.winfo_exists():
+                    popup.destroy()
+            except Exception:
+                pass
+        self.clear_active_tool("magic_outline")
 
     def set_active_tool(self, tool_name):
         if self.active_tool == tool_name:
@@ -462,11 +488,40 @@ class FrameEditorApp:
             self.close_animation_preview()
         elif previous == "color":
             self.close_color_tools()
+        elif previous == "color_range":
+            self.close_color_range_tools()
         elif previous == "rembg_settings":
             self.close_rembg_settings()
+        elif previous == "magic_outline":
+            self.close_magic_outline_tools()
 
         self.active_tool = tool_name
         return True
+
+    def reset_tools_for_new_media(self):
+        self.close_animation_preview()
+        self.close_color_tools()
+        self.close_color_range_tools()
+        self.close_rembg_settings()
+        self.close_magic_outline_tools()
+        self.active_tool = None
+        self.mask_edit_mode = False
+        self.mask_paint_mode = "restore"
+        self.mask_dragging = False
+        self.mask_brush_size = 12
+        self.wand_mode = False
+        self.wand_selection = None
+        self.wand_tolerance = 32
+        self.wand_dragging = False
+        self.wand_start_pos = None
+        self.wand_start_tolerance = 32
+        self.wand_combine_mode = "replace"
+        self.wand_drag_base = None
+        self.wand_last_drag_tolerance = None
+        with self.wand_zone_lock:
+            self.wand_zone_cache.clear()
+            self.wand_preload_targets = []
+            self.wand_preload_running = False
 
     # ---------- ffmpeg ----------
     def app_search_dirs(self):
@@ -720,6 +775,7 @@ class FrameEditorApp:
             return
 
         self.close_menus()
+        self.reset_tools_for_new_media()
         self.loading_message = f"Opening {path.name}..."
         self.force_redraw()
 
@@ -784,6 +840,7 @@ class FrameEditorApp:
             return
 
         self.close_menus()
+        self.reset_tools_for_new_media()
         self.loading_message = f"Opening {path.name}..."
         self.force_redraw()
 
@@ -2138,6 +2195,231 @@ class FrameEditorApp:
     def match_video_to_color_reference(self):
         self.match_video_to_selected_reference()
 
+    def hue_between_smaller_arc(self, hue_degrees, start_degrees, end_degrees):
+        hue = hue_degrees % 360.0
+        start = start_degrees % 360.0
+        end = end_degrees % 360.0
+        clockwise = (end - start) % 360.0
+        if clockwise <= 180.0:
+            return ((hue - start) % 360.0) <= clockwise
+        return ((hue - end) % 360.0) <= (360.0 - clockwise)
+
+    def build_color_range_region(self, image, hue_a, hue_b, sat_low, sat_high):
+        try:
+            import numpy as np
+        except ImportError:
+            self.set_status("Install numpy to use color range selection")
+            return None
+
+        hsv = image.convert("RGB").convert("HSV")
+        data = np.asarray(hsv, dtype=np.float32)
+        hue_degrees = data[..., 0] * (360.0 / 255.0)
+        saturation = data[..., 1] * (200.0 / 255.0)
+        low = min(float(sat_low), float(sat_high))
+        high = max(float(sat_low), float(sat_high))
+        hue_low = min(float(hue_a), float(hue_b)) % 360.0
+        hue_high = max(float(hue_a), float(hue_b)) % 360.0
+        if abs(hue_high - hue_low) < 0.0001:
+            hue_tolerance = 360.0 / 255.0
+            hue_delta = np.minimum((hue_degrees - hue_low) % 360.0, (hue_low - hue_degrees) % 360.0)
+            hue_mask = hue_delta <= hue_tolerance
+        else:
+            hue_mask = (hue_degrees >= hue_low) & (hue_degrees <= hue_high)
+        return hue_mask & (saturation >= low) & (saturation <= high)
+
+    def apply_color_range_selection_to_frame(self, index, hue_a, hue_b, sat_low, sat_high, alpha_value):
+        image = self.open_image_copy(self.frame_paths[index], "RGBA", "open color range frame")
+        if image is None:
+            return False
+        try:
+            region = self.build_color_range_region(image, hue_a, hue_b, sat_low, sat_high)
+            if region is None:
+                return False
+            import numpy as np
+            alpha = np.asarray(image.getchannel("A"), dtype=np.uint8).copy()
+            alpha[region] = alpha_value
+            image.putalpha(Image.fromarray(alpha, "L"))
+            if not self.save_edited_frame(index, image):
+                return False
+            return True
+        finally:
+            image.close()
+
+    def sample_frame_hue_saturation(self, image_pos):
+        image = self.open_image_copy(self.frame_paths[self.current_index], "RGB", "sample color range pixel")
+        if image is None:
+            return None
+        try:
+            x, y = image_pos
+            r, g, b = image.getpixel((x, y))
+        finally:
+            image.close()
+
+        import colorsys
+        hue, saturation, _value = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
+        return hue * 360.0, saturation * 200.0
+
+    def open_color_range_tools(self):
+        if not self.frames:
+            self.set_status("Open a video before using color range")
+            return
+
+        if self.active_tool == "color_range" and self.color_range_popup is not None and self.color_range_popup.winfo_exists():
+            self.color_range_popup.lift()
+            return
+        self.set_active_tool("color_range")
+
+        popup = Toplevel(self.tk_root)
+        popup.title("Remove By Color")
+        popup.resizable(False, False)
+        self.color_range_popup = popup
+
+        main = Frame(popup, padx=14, pady=12)
+        main.pack()
+
+        wheel_image = self.make_color_wheel_image()
+        wheel_photo = ImageTk.PhotoImage(wheel_image)
+        wheel_label = Label(main, image=wheel_photo, cursor="crosshair")
+        wheel_label.image = wheel_photo
+        wheel_label.grid(row=0, column=0, rowspan=7, padx=(0, 14))
+
+        hue_a_var = StringVar(value="0")
+        hue_b_var = StringVar(value="40")
+        status_var = StringVar(value="Left click sets low; right click sets high")
+
+        Label(main, text="Low Hue").grid(row=1, column=1, sticky="w")
+        Entry(main, textvariable=hue_a_var, width=8).grid(row=1, column=2, sticky="ew", pady=3)
+        Label(main, text="High Hue").grid(row=2, column=1, sticky="w")
+        Entry(main, textvariable=hue_b_var, width=8).grid(row=2, column=2, sticky="ew", pady=3)
+
+        Label(main, text="Sat Low").grid(row=3, column=1, sticky="w")
+        sat_low = Scale(main, from_=0, to=200, orient=HORIZONTAL, length=220, resolution=1)
+        sat_low.set(0)
+        sat_low.grid(row=3, column=2, sticky="ew")
+
+        Label(main, text="Sat High").grid(row=4, column=1, sticky="w")
+        sat_high = Scale(main, from_=0, to=200, orient=HORIZONTAL, length=220, resolution=1)
+        sat_high.set(200)
+        sat_high.grid(row=4, column=2, sticky="ew")
+
+        Label(main, textvariable=status_var, anchor="w").grid(row=5, column=1, columnspan=2, sticky="ew", pady=(8, 0))
+
+        def values():
+            return float(hue_a_var.get()), float(hue_b_var.get()), sat_low.get(), sat_high.get()
+
+        def update_selection(combine_mode="replace"):
+            try:
+                hue_a, hue_b, low, high = values()
+            except ValueError:
+                status_var.set("Hue values must be numbers")
+                return
+            image = self.open_image_copy(self.frame_paths[self.current_index], "RGBA", "open color range frame")
+            if image is None:
+                return
+            try:
+                region = self.build_color_range_region(image, hue_a, hue_b, low, high)
+            finally:
+                image.close()
+            if region is None:
+                return
+            self.combine_selection_region(region, combine_mode)
+            selected = int(region.sum()) if hasattr(region, "sum") else 0
+            status_var.set(f"Selected {selected} matching pixels")
+
+        def set_low_sample(hue, saturation=None):
+            hue_a_var.set(f"{hue:.0f}")
+            update_selection("replace")
+
+        def set_high_sample(hue, saturation=None):
+            hue_b_var.set(f"{hue:.0f}")
+            update_selection("replace")
+
+        def pick_from_wheel(event, high=False):
+            import math
+
+            size = 160
+            center = (size - 1) / 2.0
+            dx = event.x - center
+            dy = event.y - center
+            radius = (dx * dx + dy * dy) ** 0.5
+            if radius > center:
+                return
+            hue = (math.degrees(math.atan2(dy, dx)) + 360.0) % 360.0
+            if high:
+                set_high_sample(hue)
+            else:
+                set_low_sample(hue)
+
+        def sample_from_image(image_pos, high=False):
+            sample = self.sample_frame_hue_saturation(image_pos)
+            if sample is None:
+                return
+            hue, saturation = sample
+            if high:
+                set_high_sample(hue)
+                self.set_status(f"Color range high {hue:.0f} hue / {saturation:.0f} sat")
+            else:
+                set_low_sample(hue)
+                self.set_status(f"Color range low {hue:.0f} hue / {saturation:.0f} sat")
+
+        def erase_current():
+            try:
+                hue_a, hue_b, low, high = values()
+            except ValueError:
+                status_var.set("Hue values must be numbers")
+                return
+            if self.apply_color_range_selection_to_frame(self.current_index, hue_a, hue_b, low, high, 0):
+                self.prime_caches_near_current()
+                self.rebuild_timeline_metrics()
+                self.set_status("Erased color range on selected frame")
+
+        def erase_all():
+            try:
+                hue_a, hue_b, low, high = values()
+            except ValueError:
+                status_var.set("Hue values must be numbers")
+                return
+            self.loading_message = "Erasing color range..."
+            self.force_redraw()
+            for i in range(len(self.frame_paths)):
+                self.loading_message = f"Erasing color range... {i + 1}/{len(self.frame_paths)}"
+                if i % 5 == 0:
+                    self.force_redraw()
+                if not self.apply_color_range_selection_to_frame(i, hue_a, hue_b, low, high, 0):
+                    self.loading_message = ""
+                    return
+            self.loading_message = ""
+            self.invalidate_frame_cache()
+            self.prime_caches_near_current()
+            self.rebuild_timeline_metrics()
+            self.set_status("Erased color range on all frames", 5000)
+
+        def close_popup():
+            self.close_color_range_tools()
+
+        sat_low.configure(command=lambda _value: update_selection("replace"))
+        sat_high.configure(command=lambda _value: update_selection("replace"))
+        hue_a_var.trace_add("write", lambda *_args: update_selection("replace"))
+        hue_b_var.trace_add("write", lambda *_args: update_selection("replace"))
+        wheel_label.bind("<Button-1>", lambda event: pick_from_wheel(event, high=False))
+        wheel_label.bind("<B1-Motion>", lambda event: pick_from_wheel(event, high=False))
+        wheel_label.bind("<Button-3>", lambda event: pick_from_wheel(event, high=True))
+        wheel_label.bind("<B3-Motion>", lambda event: pick_from_wheel(event, high=True))
+        self.color_range_image_sampler = sample_from_image
+
+        buttons = Frame(main)
+        buttons.grid(row=6, column=1, columnspan=2, sticky="e", pady=(12, 0))
+        Button(buttons, text="Preview Selection", command=lambda: update_selection("replace")).pack(side="left", padx=(0, 8))
+        Button(buttons, text="Add Selection", command=lambda: update_selection("add")).pack(side="left", padx=(0, 8))
+        Button(buttons, text="Subtract Selection", command=lambda: update_selection("subtract")).pack(side="left", padx=(0, 8))
+        Button(buttons, text="Erase Current", command=erase_current).pack(side="left", padx=(0, 8))
+        Button(buttons, text="Erase All", command=erase_all).pack(side="left", padx=(0, 8))
+        Button(buttons, text="Close", command=close_popup).pack(side="left")
+
+        popup.protocol("WM_DELETE_WINDOW", close_popup)
+        popup.bind("<Escape>", lambda _event: close_popup())
+        update_selection("replace")
+
     def open_color_tools(self):
         if not self.frames:
             self.set_status("Open a video before using color tools")
@@ -2346,11 +2628,11 @@ class FrameEditorApp:
 
     def set_mask_restore_mode(self):
         self.mask_paint_mode = "restore"
-        self.set_status("Mask brush restores image")
+        self.set_status("Mask brush adds to selection")
 
     def set_mask_erase_mode(self):
         self.mask_paint_mode = "erase"
-        self.set_status("Mask brush erases image")
+        self.set_status("Mask brush removes from selection")
 
     def toggle_wand_mode(self):
         if self.wand_mode:
@@ -2380,6 +2662,39 @@ class FrameEditorApp:
         self.wand_selection = None
         self.wand_dragging = False
         self.set_status("Selection cleared")
+
+    def combine_selection_region(self, region, combine_mode="replace"):
+        if region is None:
+            return
+        base = self.wand_selection
+        if combine_mode == "add" and base is not None:
+            self.wand_selection = base | region
+        elif combine_mode == "subtract" and base is not None:
+            self.wand_selection = base & ~region
+        elif combine_mode == "subtract":
+            self.wand_selection = None
+        else:
+            self.wand_selection = region
+
+    def brush_selection_at(self, mouse, combine_mode="add"):
+        pos = self.preview_to_image_pos(mouse)
+        if pos is None:
+            return
+
+        try:
+            import numpy as np
+        except ImportError:
+            self.set_status("Install numpy to use mask selection brush")
+            return
+
+        full = self.load_full_surface(self.current_index)
+        img_w, img_h = full.get_size()
+        x, y = pos
+        yy, xx = np.ogrid[:img_h, :img_w]
+        radius = max(1, int(self.mask_brush_size))
+        region = ((xx - x) * (xx - x) + (yy - y) * (yy - y)) <= radius * radius
+        self.combine_selection_region(region, combine_mode)
+        self.set_status("Added to selection" if combine_mode == "add" else "Removed from selection")
 
     def adjust_mask_brush_size(self, delta):
         sizes = list(range(1, 11)) + [12, 15, 20, 25, 32, 40, 50, 64, 80, 100, 128, 160, 200]
@@ -2412,26 +2727,8 @@ class FrameEditorApp:
         return x, y
 
     def paint_mask_at(self, mouse):
-        pos = self.preview_to_image_pos(mouse)
-        if pos is None:
-            return
-
-        x, y = pos
-        image = self.open_image_copy(self.frame_paths[self.current_index], "RGBA", "open frame for mask edit")
-        if image is None:
-            return
-        alpha = image.getchannel("A")
-        try:
-            from PIL import ImageDraw
-            draw = ImageDraw.Draw(alpha)
-            r = self.mask_brush_size
-            fill = 255 if self.mask_paint_mode == "restore" else 0
-            draw.ellipse((x - r, y - r, x + r, y + r), fill=fill)
-            image.putalpha(alpha)
-            if not self.save_edited_frame(self.current_index, image):
-                return
-        finally:
-            image.close()
+        combine_mode = "add" if self.mask_paint_mode == "restore" else "subtract"
+        self.brush_selection_at(mouse, combine_mode)
 
     def get_wand_zone_cache(self, index):
         with self.wand_zone_lock:
@@ -2713,6 +3010,262 @@ class FrameEditorApp:
             self.set_status("Filled current frame mask")
         finally:
             image.close()
+
+    def keep_largest_mask_component(self, mask, np):
+        h, w = mask.shape
+        visited = np.zeros_like(mask, dtype=bool)
+        best_pixels = []
+        for y in range(h):
+            for x in range(w):
+                if not mask[y, x] or visited[y, x]:
+                    continue
+                stack = [(x, y)]
+                visited[y, x] = True
+                pixels = []
+                while stack:
+                    px, py = stack.pop()
+                    pixels.append((px, py))
+                    for nx, ny in ((px - 1, py), (px + 1, py), (px, py - 1), (px, py + 1)):
+                        if 0 <= nx < w and 0 <= ny < h and mask[ny, nx] and not visited[ny, nx]:
+                            visited[ny, nx] = True
+                            stack.append((nx, ny))
+                if len(pixels) > len(best_pixels):
+                    best_pixels = pixels
+
+        result = np.zeros_like(mask, dtype=bool)
+        for x, y in best_pixels:
+            result[y, x] = True
+        return result
+
+    def flood_exterior_mask(self, solid, np):
+        h, w = solid.shape
+        exterior = np.zeros_like(solid, dtype=bool)
+        stack = []
+
+        for x in range(w):
+            if not solid[0, x]:
+                stack.append((x, 0))
+                exterior[0, x] = True
+            if not solid[h - 1, x] and not exterior[h - 1, x]:
+                stack.append((x, h - 1))
+                exterior[h - 1, x] = True
+        for y in range(h):
+            if not solid[y, 0] and not exterior[y, 0]:
+                stack.append((0, y))
+                exterior[y, 0] = True
+            if not solid[y, w - 1] and not exterior[y, w - 1]:
+                stack.append((w - 1, y))
+                exterior[y, w - 1] = True
+
+        while stack:
+            x, y = stack.pop()
+            for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                if 0 <= nx < w and 0 <= ny < h and not solid[ny, nx] and not exterior[ny, nx]:
+                    exterior[ny, nx] = True
+                    stack.append((nx, ny))
+        return exterior
+
+    def dilate_mask(self, mask, steps):
+        result = mask.copy()
+        for _ in range(steps):
+            grown = result.copy()
+            grown[1:, :] |= result[:-1, :]
+            grown[:-1, :] |= result[1:, :]
+            grown[:, 1:] |= result[:, :-1]
+            grown[:, :-1] |= result[:, 1:]
+            result = grown
+        return result
+
+    def erode_mask(self, mask, steps):
+        result = mask.copy()
+        for _ in range(steps):
+            eroded = result.copy()
+            eroded[1:, :] &= result[:-1, :]
+            eroded[:-1, :] &= result[1:, :]
+            eroded[:, 1:] &= result[:, :-1]
+            eroded[:, :-1] &= result[:, 1:]
+            eroded[0, :] = False
+            eroded[-1, :] = False
+            eroded[:, 0] = False
+            eroded[:, -1] = False
+            result = eroded
+        return result
+
+    def build_magic_outline_regions(self, alpha):
+        try:
+            import numpy as np
+        except ImportError:
+            self.set_status("Install numpy to use magic outline")
+            return None
+
+        alpha_array = np.asarray(alpha, dtype=np.uint8)
+        solid = alpha_array >= 204
+        if solid.shape[0] < 3 or solid.shape[1] < 3:
+            return None
+
+        silhouette = self.keep_largest_mask_component(solid, np)
+        grown = self.dilate_mask(silhouette, 1)
+        shrunk = self.erode_mask(silhouette, 1)
+        outline = grown & ~shrunk
+        outer = outline & ~silhouette
+        inner = outline & silhouette
+
+        outside = self.dilate_mask(grown, 1) & ~grown
+        outside[0, :] = False
+        outside[-1, :] = False
+        outside[:, 0] = False
+        outside[:, -1] = False
+
+        outer[0, :] = False
+        outer[-1, :] = False
+        outer[:, 0] = False
+        outer[:, -1] = False
+        inner[0, :] = False
+        inner[-1, :] = False
+        inner[:, 0] = False
+        inner[:, -1] = False
+        return {
+            "outside": outside,
+            "outer": outer,
+            "inner": inner,
+        }
+
+    def apply_magic_outline_to_frame(self, index):
+        image = self.open_image_copy(self.frame_paths[index], "RGBA", "open frame for magic outline")
+        if image is None:
+            return False
+        try:
+            import numpy as np
+            regions = self.build_magic_outline_regions(image.getchannel("A"))
+            if regions is None:
+                return False
+            pixels = np.asarray(image.convert("RGBA"), dtype=np.uint8).copy()
+            outside = regions["outside"]
+            outer = regions["outer"]
+            inner = regions["inner"]
+            outline = outer | inner
+            pixels[outside, 3] = 0
+            pixels[outline, 0] = 10
+            pixels[outline, 1] = 10
+            pixels[outline, 2] = 10
+            pixels[outer, 3] = 191
+            pixels[inner, 3] = 255
+            result = Image.fromarray(pixels, "RGBA")
+            if not self.save_edited_frame(index, result):
+                return False
+            return True
+        finally:
+            image.close()
+
+    def clear_magic_outline_from_frame(self, index):
+        image = self.open_image_copy(self.frame_paths[index], "RGBA", "open frame for clearing magic outline")
+        if image is None:
+            return False
+        try:
+            import numpy as np
+            regions = self.build_magic_outline_regions(image.getchannel("A"))
+            if regions is None:
+                return False
+            pixels = np.asarray(image.convert("RGBA"), dtype=np.uint8).copy()
+            dark = (
+                (pixels[..., 0] <= 18)
+                & (pixels[..., 1] <= 18)
+                & (pixels[..., 2] <= 18)
+                & (pixels[..., 3] > 0)
+            )
+            outline = regions["outer"] | regions["inner"]
+            clear_pixels = dark & outline
+            if not clear_pixels.any():
+                return True
+            pixels[clear_pixels, 3] = 0
+            result = Image.fromarray(pixels, "RGBA")
+            if not self.save_edited_frame(index, result):
+                return False
+            return True
+        finally:
+            image.close()
+
+    def magic_outline_current_frame(self):
+        if not self.frames:
+            return
+        if self.apply_magic_outline_to_frame(self.current_index):
+            self.prime_caches_near_current()
+            self.rebuild_timeline_metrics()
+            self.set_status("Added magic outline")
+
+    def magic_outline_whole_video(self):
+        if not self.frames:
+            return
+        self.loading_message = "Adding magic outline..."
+        self.force_redraw()
+        for i in range(len(self.frame_paths)):
+            self.loading_message = f"Adding magic outline... {i + 1}/{len(self.frame_paths)}"
+            if i % 5 == 0:
+                self.force_redraw()
+            if not self.apply_magic_outline_to_frame(i):
+                self.loading_message = ""
+                return
+        self.loading_message = ""
+        self.invalidate_frame_cache()
+        self.prime_caches_near_current()
+        self.rebuild_timeline_metrics()
+        self.set_status("Added magic outline to all frames", 5000)
+
+    def clear_magic_outline_current_frame(self):
+        if not self.frames:
+            return
+        if self.clear_magic_outline_from_frame(self.current_index):
+            self.prime_caches_near_current()
+            self.rebuild_timeline_metrics()
+            self.set_status("Cleared magic outline")
+
+    def clear_magic_outline_whole_video(self):
+        if not self.frames:
+            return
+        self.loading_message = "Clearing magic outline..."
+        self.force_redraw()
+        for i in range(len(self.frame_paths)):
+            self.loading_message = f"Clearing magic outline... {i + 1}/{len(self.frame_paths)}"
+            if i % 5 == 0:
+                self.force_redraw()
+            if not self.clear_magic_outline_from_frame(i):
+                self.loading_message = ""
+                return
+        self.loading_message = ""
+        self.invalidate_frame_cache()
+        self.prime_caches_near_current()
+        self.rebuild_timeline_metrics()
+        self.set_status("Cleared magic outline from all frames", 5000)
+
+    def open_magic_outline_tools(self):
+        if not self.frames:
+            self.set_status("Open a video before using magic outline")
+            return
+        if self.active_tool == "magic_outline" and self.magic_outline_popup is not None and self.magic_outline_popup.winfo_exists():
+            self.magic_outline_popup.lift()
+            return
+        self.set_active_tool("magic_outline")
+
+        popup = Toplevel(self.tk_root)
+        popup.title("Magic Outline")
+        popup.resizable(False, False)
+        self.magic_outline_popup = popup
+
+        main = Frame(popup, padx=14, pady=12)
+        main.pack()
+        Label(main, text="Add or clear the black alpha outline.").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        Button(main, text="Add Current", command=self.magic_outline_current_frame, width=18).grid(row=1, column=0, padx=(0, 8), pady=4)
+        Button(main, text="Clear Current", command=self.clear_magic_outline_current_frame, width=18).grid(row=1, column=1, pady=4)
+        Button(main, text="Add Whole Video", command=self.magic_outline_whole_video, width=18).grid(row=2, column=0, padx=(0, 8), pady=4)
+        Button(main, text="Clear Whole Video", command=self.clear_magic_outline_whole_video, width=18).grid(row=2, column=1, pady=4)
+
+        def close_popup():
+            self.close_magic_outline_tools()
+
+        Button(main, text="Close", command=close_popup).grid(row=3, column=1, sticky="e", pady=(12, 0))
+        popup.protocol("WM_DELETE_WINDOW", close_popup)
+        popup.bind("<Escape>", lambda _event: close_popup())
 
     def remove_background_from_frame(self, index):
         try:
@@ -3257,11 +3810,11 @@ class FrameEditorApp:
         return [
             (mode_label, "M", self.toggle_mask_edit_mode, bool(self.frames)),
             (wand_label, "W", self.toggle_wand_mode, bool(self.frames)),
+            ("Remove By Color...", "", self.open_color_range_tools, bool(self.frames)),
             ("Clear Wand Selection", "", self.clear_wand_selection, self.wand_selection is not None),
-            ("Brush Restores Image", "", self.set_mask_restore_mode, bool(self.frames)),
-            ("Brush Erases Image", "", self.set_mask_erase_mode, bool(self.frames)),
             ("Fill Current Mask", "", self.fill_current_mask, bool(self.frames)),
             ("Erase Current Mask", "", self.clear_current_mask, bool(self.frames)),
+            ("Magic Outline...", "", self.open_magic_outline_tools, bool(self.frames)),
             ("RMBG Settings...", "", self.open_rembg_settings, True),
             ("Remove BG Current", "", self.remove_background_current_frame, bool(self.frames)),
             ("Remove BG Whole Video", "", self.remove_background_whole_video, bool(self.frames)),
@@ -3336,7 +3889,11 @@ class FrameEditorApp:
         if event.button == 1:
             if self.handle_menu_click(mouse):
                 return
-            if self.wand_mode and preview_rect.collidepoint(mouse):
+            if self.active_tool == "color_range" and preview_rect.collidepoint(mouse) and self.color_range_image_sampler is not None:
+                image_pos = self.preview_to_image_pos(mouse)
+                if image_pos is not None:
+                    self.color_range_image_sampler(image_pos, False)
+            elif self.wand_mode and preview_rect.collidepoint(mouse):
                 image_pos = self.preview_to_image_pos(mouse)
                 if image_pos is not None:
                     with self.wand_zone_lock:
@@ -3374,7 +3931,11 @@ class FrameEditorApp:
                 self.click_candidate = True
                 self.click_down_pos = mouse
         elif event.button == 3:
-            if self.mask_edit_mode and preview_rect.collidepoint(mouse):
+            if self.active_tool == "color_range" and preview_rect.collidepoint(mouse) and self.color_range_image_sampler is not None:
+                image_pos = self.preview_to_image_pos(mouse)
+                if image_pos is not None:
+                    self.color_range_image_sampler(image_pos, True)
+            elif self.mask_edit_mode and preview_rect.collidepoint(mouse):
                 self.mask_dragging = True
                 self.mask_paint_mode = "erase"
                 self.paint_mask_at(mouse)
@@ -3481,20 +4042,23 @@ class FrameEditorApp:
         elif event.key == pygame.K_v:
             self.paste_frame()
         elif event.key == pygame.K_DELETE:
-            if self.wand_mode:
+            if self.wand_selection is not None and (self.wand_mode or self.mask_edit_mode or self.active_tool == "color_range"):
                 self.apply_wand_selection_to_alpha(0)
             else:
                 self.delete_current_frame()
         elif event.key == pygame.K_RETURN:
-            if self.wand_mode:
+            if self.wand_selection is not None and (self.wand_mode or self.mask_edit_mode or self.active_tool == "color_range"):
                 self.apply_wand_selection_to_alpha(255)
         elif event.key == pygame.K_INSERT:
-            if self.wand_mode:
+            if self.wand_selection is not None and (self.wand_mode or self.mask_edit_mode or self.active_tool == "color_range"):
                 self.apply_wand_selection_to_alpha(255)
         elif event.key == pygame.K_0:
             self.reset_preview_view()
         elif event.key == pygame.K_ESCAPE:
-            self.close_menus()
+            if self.wand_selection is not None:
+                self.clear_wand_selection()
+            else:
+                self.close_menus()
 
     def handle_keyup(self, event):
         if event.key == pygame.K_LEFT:
@@ -3503,6 +4067,15 @@ class FrameEditorApp:
             self.right_held = False
 
     # ---------- drawing ----------
+    def get_top_bar_hints(self):
+        if self.wand_mode:
+            return ["Wand: Click Select", "Shift Add", "Ctrl Subtract", "Insert Restore", "Delete Remove Mask"]
+        if self.mask_edit_mode:
+            return ["Mask Edit: Left Add", "Right Remove", "Shift Wheel Brush", "Insert Restore", "Delete Remove Mask"]
+        if self.active_tool == "color_range":
+            return ["Color Range: Left Low", "Right High", "Insert Restore", "Delete Remove Mask"]
+        return ["Drop video here to open", "Mouse Wheel Zoom", "Drag Preview Pan", "Left/Right Frame"]
+
     def draw_top_bar(self):
         w, _ = self.get_window_size()
         pygame.draw.rect(self.screen, PANEL, (0, 0, w, TOP_BAR_H))
@@ -3520,7 +4093,7 @@ class FrameEditorApp:
             self.screen.blit(label_surf, label_surf.get_rect(center=rect.center))
             x = rect.right + 6
 
-        labels = ["Drop video here to open", "Mouse Wheel Zoom", "Drag Preview Pan", "Left/Right Frame"]
+        labels = self.get_top_bar_hints()
         x += 16
         for label in labels:
             surf = self.small_font.render(label, True, TEXT)
@@ -3657,7 +4230,7 @@ class FrameEditorApp:
                 pygame.draw.circle(self.screen, color, mouse, radius, 2)
                 pygame.draw.circle(self.screen, (255, 255, 255), mouse, max(1, radius // 6), 1)
 
-        if self.wand_mode and self.wand_selection is not None:
+        if self.wand_selection is not None and (self.wand_mode or self.mask_edit_mode or self.active_tool == "color_range"):
             self.draw_wand_selection_overlay(rect)
 
     def draw_wand_selection_overlay(self, rect):

@@ -72,6 +72,12 @@ The current project FPS is kept; the status bar notes when the appended video's 
 Optional background removal
 Background removal uses rembg if it is installed. The editor still works without it, but the Background > Remove BG options will show an install message.
 
+Mask and color selection
+Background > Mask Edit now edits the current selection instead of directly changing alpha. Left click adds to the selection, right click removes from it, and Shift + mouse wheel changes brush size.
+Use Delete to erase selected pixels from alpha, or Insert/Enter to restore selected pixels.
+Background > Remove By Color selects pixels by a hue range plus low/high saturation. Left click sets low hue, right click sets high hue, both on the wheel and on the current image. Saturation stays controlled by the 0-200 sliders. It can preview/add/subtract the current selection, erase the selected color range on the current frame, or erase it across all frames.
+Background > Magic Outline opens a tool window for adding or clearing the outline on the current frame or whole video. It keeps the largest 80%+ alpha component, drops smaller floaters, builds a tight 1px grow/1px shrink contour from that alpha shape, clears the outside fringe, and colors the outline RGB 10,10,10 with a 75% alpha outer pixel and fully visible inner pixel.
+
 CPU install:
 
 python -m pip install "rembg[cpu]"
