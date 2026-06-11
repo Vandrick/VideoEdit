@@ -15,6 +15,7 @@ from PIL import Image, ImageEnhance, ImageGrab, ImageTk
 from tkinter import Tk, Toplevel, Label, Entry, Button, Frame, StringVar, Scale, HORIZONTAL, OptionMenu, Text, filedialog, messagebox
 
 TEMP_DIR = Path("temp_frames")
+APPEND_TEMP_DIR = TEMP_DIR / "_append_video"
 BG = (18, 18, 18)
 PANEL = (28, 28, 28)
 TEXT = (235, 235, 235)
@@ -45,6 +46,9 @@ SUPPORTED_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".gif"}
 DEFAULT_IMAGE_FPS = 16.0
 SUPPORTED_IMAGE_TYPES = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
 FFMPEG_ZIP_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+RIFE_DOWNLOAD_URL = "https://github.com/nihui/rife-ncnn-vulkan/releases"
+RIFE_INPUT_DIR = TEMP_DIR / "_rife_input"
+RIFE_OUTPUT_DIR = TEMP_DIR / "_rife_output"
 
 IS_WINDOWS = sys.platform.startswith("win")
 if IS_WINDOWS:
@@ -394,10 +398,75 @@ class FrameEditorApp:
         self.rembg_erode_size = 10
         self.rembg_sessions = {}
         self.ffmpeg_help_popup = None
+        self.rife_help_popup = None
+        self.rife_popup = None
+        self.active_tool = None
 
         self.tk_root = Tk()
         self.tk_root.withdraw()
         self.check_ffmpeg_on_startup()
+
+    # ---------- tool modes ----------
+    def clear_active_tool(self, tool_name):
+        if self.active_tool == tool_name:
+            self.active_tool = None
+
+    def close_animation_preview(self):
+        popup = self.preview_popup
+        self.preview_popup = None
+        if popup is not None:
+            try:
+                if popup.winfo_exists():
+                    popup.destroy()
+            except Exception:
+                pass
+        self.clear_active_tool("preview")
+
+    def close_color_tools(self):
+        popup = self.color_popup
+        self.color_popup = None
+        self.color_tool_refresh = None
+        if popup is not None:
+            try:
+                if popup.winfo_exists():
+                    popup.destroy()
+            except Exception:
+                pass
+        self.clear_active_tool("color")
+
+    def close_rembg_settings(self):
+        popup = self.rembg_settings_popup
+        self.rembg_settings_popup = None
+        if popup is not None:
+            try:
+                if popup.winfo_exists():
+                    popup.destroy()
+            except Exception:
+                pass
+        self.clear_active_tool("rembg_settings")
+
+    def set_active_tool(self, tool_name):
+        if self.active_tool == tool_name:
+            return True
+
+        previous = self.active_tool
+        if previous == "mask":
+            self.mask_edit_mode = False
+            self.mask_dragging = False
+        elif previous == "wand":
+            self.wand_mode = False
+            self.wand_dragging = False
+            self.wand_start_pos = None
+            self.wand_drag_base = None
+        elif previous == "preview":
+            self.close_animation_preview()
+        elif previous == "color":
+            self.close_color_tools()
+        elif previous == "rembg_settings":
+            self.close_rembg_settings()
+
+        self.active_tool = tool_name
+        return True
 
     # ---------- ffmpeg ----------
     def app_search_dirs(self):
@@ -421,6 +490,13 @@ class FrameEditorApp:
                 candidate = folder / candidate_name
                 if candidate.exists():
                     return str(candidate)
+                for child in (
+                    folder / "tools" / candidate_name,
+                    folder / "tools" / "rife-ncnn-vulkan" / candidate_name,
+                    folder / "rife-ncnn-vulkan" / candidate_name,
+                ):
+                    if child.exists():
+                        return str(child)
         return shutil.which(name)
 
     def has_ffmpeg_tools(self):
@@ -528,6 +604,64 @@ class FrameEditorApp:
     def check_ffmpeg_on_startup(self):
         if not self.has_ffmpeg_tools():
             self.show_ffmpeg_missing_help()
+
+    # ---------- RIFE ----------
+    def find_rife_tool(self):
+        return self.find_app_tool("rife-ncnn-vulkan")
+
+    def build_rife_install_message(self):
+        working_dir = Path.cwd().resolve()
+        return "\n".join(
+            [
+                "RIFE was not found.",
+                "",
+                "VideoEdit looks for rife-ncnn-vulkan.exe beside the app, in a tools folder, or on PATH.",
+                "",
+                "Download the portable Windows build here:",
+                RIFE_DOWNLOAD_URL,
+                "",
+                "Extract it, then either:",
+                f"1. Copy rife-ncnn-vulkan.exe and its models folder into {working_dir}",
+                f"2. Or put the extracted folder at {working_dir}\\tools\\rife-ncnn-vulkan",
+                "",
+                "The ncnn Vulkan build is portable and does not need CUDA or PyTorch.",
+                "Restart VideoEdit after placing the files.",
+            ]
+        )
+
+    def show_rife_missing_help(self):
+        if self.rife_help_popup is not None and self.rife_help_popup.winfo_exists():
+            self.rife_help_popup.lift()
+            return
+
+        popup = Toplevel(self.tk_root)
+        popup.title("RIFE Not Found")
+        popup.geometry("760x420")
+        popup.resizable(True, True)
+        self.rife_help_popup = popup
+
+        Label(popup, text="RIFE interpolation requires rife-ncnn-vulkan.").pack(anchor="w", padx=12, pady=(12, 6))
+        text = Text(popup, wrap="word", height=18)
+        text.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+        text.insert("1.0", self.build_rife_install_message())
+
+        buttons = Frame(popup)
+        buttons.pack(fill="x", padx=12, pady=(0, 12))
+
+        def copy_text():
+            self.tk_root.clipboard_clear()
+            self.tk_root.clipboard_append(text.get("1.0", "end-1c"))
+            self.set_status("Copied RIFE instructions")
+
+        def close_popup():
+            if self.rife_help_popup is popup:
+                self.rife_help_popup = None
+            popup.destroy()
+
+        Button(buttons, text="Copy Instructions", command=copy_text).pack(side="left")
+        Button(buttons, text="Close", command=close_popup).pack(side="right")
+        popup.protocol("WM_DELETE_WINDOW", close_popup)
+        self.set_status("RIFE not found; install instructions opened", 5000)
 
     def detect_fps(self, file_path):
         try:
@@ -810,6 +944,11 @@ class FrameEditorApp:
             self.set_status("Open a video before previewing")
             return
 
+        if self.active_tool == "preview" and self.preview_popup is not None and self.preview_popup.winfo_exists():
+            self.preview_popup.lift()
+            return
+        self.set_active_tool("preview")
+
         width, height, fps = self.get_retarget_settings()
         if self.preview_popup is not None and self.preview_popup.winfo_exists():
             self.preview_popup.destroy()
@@ -824,9 +963,7 @@ class FrameEditorApp:
         self.preview_popup = popup
 
         def close_preview():
-            if self.preview_popup is popup:
-                self.preview_popup = None
-            popup.destroy()
+            self.close_animation_preview()
 
         popup.protocol("WM_DELETE_WINDOW", close_preview)
 
@@ -1000,6 +1137,342 @@ class FrameEditorApp:
             self.show_file_error("export GIF", save_path, exc)
             return
         self.set_status("Exported high quality GIF")
+
+    def clear_rife_work_dirs(self):
+        for folder in (RIFE_INPUT_DIR, RIFE_OUTPUT_DIR):
+            if folder.exists():
+                result = self.retry_file_operation(f"clear {folder.name}", lambda target=folder: shutil.rmtree(target), folder)
+                if result is None and folder.exists():
+                    return False
+            folder.mkdir(parents=True, exist_ok=True)
+        (RIFE_OUTPUT_DIR / "ext").mkdir(parents=True, exist_ok=True)
+        return True
+
+    def stage_rife_input_frames(self):
+        if not self.clear_rife_work_dirs():
+            return False
+        for i, path in enumerate(self.frame_paths, start=1):
+            staged = RIFE_INPUT_DIR / f"{i:08d}.png"
+            image = self.open_image_copy(path, "RGB", "open RIFE input frame")
+            if image is None:
+                return False
+            if not self.save_image_retry(image, staged, "stage RIFE input frame"):
+                return False
+        return True
+
+    def stage_rife_paths(self, paths):
+        if not self.clear_rife_work_dirs():
+            return False
+        for i, path in enumerate(paths, start=1):
+            staged = RIFE_INPUT_DIR / f"{i:08d}.png"
+            image = self.open_image_copy(path, "RGB", "open RIFE blend frame")
+            if image is None:
+                return False
+            if not self.save_image_retry(image, staged, "stage RIFE blend frame"):
+                return False
+        return True
+
+    def get_rife_command(self, rife, multiplier, model_name, spatial_tta=False, temporal_tta=False, uhd_mode=False, target_count=None):
+        command = [
+            rife,
+            "-i",
+            str(RIFE_INPUT_DIR.resolve()),
+            "-o",
+            str(RIFE_OUTPUT_DIR.resolve()),
+            "-f",
+            "ext/%08d.png",
+        ]
+        if target_count is not None and model_name == "rife-v4":
+            command.extend(["-n", str(target_count)])
+        if model_name and model_name != "Default":
+            command.extend(["-m", model_name])
+        if spatial_tta:
+            command.append("-x")
+        if temporal_tta:
+            command.append("-z")
+        if uhd_mode:
+            command.append("-u")
+        return command
+
+    def run_rife_command(self, command, rife, label):
+        self.loading_message = label
+        self.force_redraw()
+        try:
+            subprocess.run(command, cwd=str(Path(rife).resolve().parent), check=True)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            self.loading_message = ""
+            self.show_file_error("run RIFE interpolation", rife, exc)
+            return None
+        return sorted(RIFE_OUTPUT_DIR.rglob("*.png"))
+
+    def apply_rife_output_frames(self, multiplier):
+        output_paths = sorted(RIFE_OUTPUT_DIR.rglob("*.png"))
+        if len(output_paths) < 2:
+            self.set_status("RIFE did not create enough frames", 5000)
+            return False
+
+        self.release_file_caches()
+        for path in sorted(TEMP_DIR.glob("frame_*.png")):
+            if not self.unlink_path_retry(path, show_error=True):
+                return False
+
+        for i, path in enumerate(output_paths, start=1):
+            destination = TEMP_DIR / f"frame_{i:06d}.png"
+            if not self.copy_path_retry(path, destination, "copy RIFE output frame"):
+                return False
+
+        self.frame_paths = sorted(TEMP_DIR.glob("frame_*.png"))
+        self.frames = [p.name for p in self.frame_paths]
+        self.current_index = min(self.current_index * multiplier, max(0, len(self.frames) - 1))
+        self.fps *= multiplier
+        if self.retarget_fps is not None:
+            self.retarget_fps *= multiplier
+        self.reset_after_frame_list_change()
+        self.set_status(f"RIFE interpolated to {len(self.frames)} frames @ {self.fps:.3f} FPS", 5000)
+        return True
+
+    def run_rife_interpolation(self, multiplier, model_name, spatial_tta, temporal_tta, uhd_mode):
+        rife = self.find_rife_tool()
+        if not rife:
+            self.show_rife_missing_help()
+            return
+
+        if len(self.frames) < 2:
+            self.set_status("RIFE needs at least two frames")
+            return
+
+        if multiplier != 2 and model_name != "rife-v4":
+            self.set_status("RIFE 3x/4x requires the rife-v4 model", 5000)
+            return
+
+        if not self.stage_rife_input_frames():
+            return
+
+        target_count = len(self.frames) * multiplier if multiplier != 2 else None
+        command = self.get_rife_command(rife, multiplier, model_name, spatial_tta, temporal_tta, uhd_mode, target_count=target_count)
+        output_paths = self.run_rife_command(command, rife, f"Running RIFE {multiplier}x...")
+        if output_paths is None:
+            return
+
+        self.loading_message = "Loading RIFE frames..."
+        self.force_redraw()
+        self.apply_rife_output_frames(multiplier)
+        self.loading_message = ""
+
+    def color_lerp_rife_frames(self, paths, left_reference_path, right_reference_path):
+        try:
+            import numpy as np
+        except ImportError:
+            self.set_status("Install numpy to use RIFE blend color lerp")
+            return None
+
+        left_reference = self.open_image_copy(left_reference_path, "RGB", "open left RIFE color reference")
+        right_reference = self.open_image_copy(right_reference_path, "RGB", "open right RIFE color reference")
+        if left_reference is None or right_reference is None:
+            return None
+
+        count = len(paths)
+        if count == 0:
+            return []
+
+        blended_frames = []
+        for i, path in enumerate(paths):
+            image = self.open_image_copy(path, "RGBA", "open RIFE blend frame")
+            if image is None:
+                return None
+            alpha = image.getchannel("A")
+            base_rgb = image.convert("RGB")
+            left_matched = self.apply_color_match_method(base_rgb, left_reference).convert("RGB")
+            right_matched = self.apply_color_match_method(base_rgb, right_reference).convert("RGB")
+            t = i / max(1, count - 1)
+            left_array = np.asarray(left_matched, dtype=np.float32)
+            right_array = np.asarray(right_matched, dtype=np.float32)
+            result_array = np.clip(left_array * (1.0 - t) + right_array * t, 0, 255).astype("uint8")
+            result = Image.fromarray(result_array, "RGB").convert("RGBA")
+            result.putalpha(alpha)
+            blended_frames.append(result)
+        return blended_frames
+
+    def replace_frames_with_sequence(self, sequence, status_message, current_index=0):
+        prepared = []
+        for item in sequence:
+            if isinstance(item, Image.Image):
+                prepared.append(item.convert("RGBA").copy())
+            else:
+                image = self.open_image_copy(item, "RGBA", "prepare replacement frame")
+                if image is None:
+                    return False
+                prepared.append(image)
+
+        self.release_file_caches()
+        for path in sorted(TEMP_DIR.glob("frame_*.png")):
+            if not self.unlink_path_retry(path, show_error=True):
+                return False
+
+        for i, image in enumerate(prepared, start=1):
+            destination = TEMP_DIR / f"frame_{i:06d}.png"
+            if not self.save_image_retry(image, destination, "save blended RIFE frame"):
+                return False
+
+        self.frame_paths = sorted(TEMP_DIR.glob("frame_*.png"))
+        self.frames = [p.name for p in self.frame_paths]
+        self.current_index = max(0, min(current_index, len(self.frames) - 1))
+        self.reset_after_frame_list_change()
+        self.set_status(status_message, 5000)
+        return True
+
+    def get_middle_rife_frames(self, output_paths, count=6):
+        if len(output_paths) < count:
+            return []
+        start = max(0, (len(output_paths) - count) // 2)
+        return output_paths[start:start + count]
+
+    def run_rife_blend_from_paths(self, input_paths, left_reference_path, right_reference_path, model_name="rife-anime"):
+        rife = self.find_rife_tool()
+        if not rife:
+            self.show_rife_missing_help()
+            return None
+
+        if not self.stage_rife_paths(input_paths):
+            return None
+
+        command = self.get_rife_command(rife, 2, model_name, target_count=len(input_paths) * 2)
+        output_paths = self.run_rife_command(command, rife, "Running RIFE blend...")
+        if output_paths is None:
+            return None
+
+        middle_paths = self.get_middle_rife_frames(output_paths, 6)
+        if len(middle_paths) < 6:
+            self.loading_message = ""
+            self.set_status("RIFE blend did not create enough middle frames", 5000)
+            return None
+
+        self.loading_message = "Color matching RIFE blend..."
+        self.force_redraw()
+        blended = self.color_lerp_rife_frames(middle_paths, left_reference_path, right_reference_path)
+        self.loading_message = ""
+        return blended
+
+    def rife_blend_selected_split(self):
+        if not self.frames:
+            return
+        if self.current_index < 3 or (len(self.frames) - self.current_index - 1) < 3:
+            self.set_status("Select a frame with at least 3 frames before and after it", 5000)
+            return
+
+        left_indices = [self.current_index - 3, self.current_index - 2, self.current_index - 1]
+        right_indices = [self.current_index + 1, self.current_index + 2, self.current_index + 3]
+        input_paths = [self.frame_paths[i] for i in left_indices + right_indices]
+        blended = self.run_rife_blend_from_paths(input_paths, self.frame_paths[left_indices[0]], self.frame_paths[right_indices[-1]])
+        if blended is None:
+            return
+
+        sequence = list(self.frame_paths[:left_indices[0] + 1]) + blended + list(self.frame_paths[right_indices[-1]:])
+        self.replace_frames_with_sequence(sequence, "RIFE blended selected split", current_index=left_indices[0] + 1)
+
+    def rife_blend_loop(self):
+        if len(self.frames) < 8:
+            self.set_status("RIFE loop blend needs at least 8 frames")
+            return
+
+        frame_count = len(self.frames)
+        left_indices = [frame_count - 4, frame_count - 3, frame_count - 2]
+        right_indices = [1, 2, 3]
+        input_paths = [self.frame_paths[i] for i in left_indices + right_indices]
+        blended = self.run_rife_blend_from_paths(input_paths, self.frame_paths[frame_count - 3], self.frame_paths[3])
+        if blended is None:
+            return
+
+        sequence = list(self.frame_paths)
+        sequence[:3] = blended[3:]
+        sequence = sequence[:frame_count - 2] + blended[:3]
+        self.replace_frames_with_sequence(sequence, "RIFE rebuilt loop seam", current_index=frame_count - 2)
+
+    def open_rife_interpolation(self):
+        if not self.frames:
+            self.set_status("Open a video before using RIFE")
+            return
+        if len(self.frames) < 2:
+            self.set_status("RIFE needs at least two frames")
+            return
+        if not self.find_rife_tool():
+            self.show_rife_missing_help()
+            return
+
+        if self.rife_popup is not None and self.rife_popup.winfo_exists():
+            self.rife_popup.lift()
+            return
+
+        popup = Toplevel(self.tk_root)
+        popup.title("RIFE Interpolation")
+        popup.resizable(False, False)
+        self.rife_popup = popup
+
+        main = Frame(popup, padx=14, pady=12)
+        main.pack()
+
+        multiplier_var = StringVar(value="2")
+        model_var = StringVar(value="rife-anime")
+        spatial_var = StringVar(value="Off")
+        temporal_var = StringVar(value="Off")
+        uhd_var = StringVar(value="Off")
+        error_var = StringVar(value="")
+
+        Label(main, text="Multiplier").grid(row=0, column=0, sticky="w", pady=4)
+        OptionMenu(main, multiplier_var, "2", "3", "4").grid(row=0, column=1, sticky="ew", padx=(12, 0), pady=4)
+
+        Label(main, text="Model").grid(row=1, column=0, sticky="w", pady=4)
+        OptionMenu(
+            main,
+            model_var,
+            "Default",
+            "rife-anime",
+            "rife-v4.6",
+            "rife-v4",
+            "rife-v3.1",
+            "rife-v2.4",
+            "rife-v2.3",
+        ).grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=4)
+
+        Label(main, text="Spatial TTA").grid(row=2, column=0, sticky="w", pady=4)
+        OptionMenu(main, spatial_var, "Off", "On").grid(row=2, column=1, sticky="ew", padx=(12, 0), pady=4)
+
+        Label(main, text="Temporal TTA").grid(row=3, column=0, sticky="w", pady=4)
+        OptionMenu(main, temporal_var, "Off", "On").grid(row=3, column=1, sticky="ew", padx=(12, 0), pady=4)
+
+        Label(main, text="UHD Mode").grid(row=4, column=0, sticky="w", pady=4)
+        OptionMenu(main, uhd_var, "Off", "On").grid(row=4, column=1, sticky="ew", padx=(12, 0), pady=4)
+
+        Label(main, textvariable=error_var, fg="red").grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        buttons = Frame(main)
+        buttons.grid(row=6, column=0, columnspan=2, sticky="e", pady=(12, 0))
+
+        def close_popup():
+            if self.rife_popup is popup:
+                self.rife_popup = None
+            popup.destroy()
+
+        def apply_rife():
+            try:
+                multiplier = int(multiplier_var.get())
+            except ValueError:
+                error_var.set("Multiplier must be a number.")
+                return
+            close_popup()
+            self.run_rife_interpolation(
+                multiplier,
+                model_var.get(),
+                spatial_var.get() == "On",
+                temporal_var.get() == "On",
+                uhd_var.get() == "On",
+            )
+
+        Button(buttons, text="Cancel", command=close_popup).pack(side="right", padx=(8, 0))
+        Button(buttons, text="Interpolate", command=apply_rife).pack(side="right")
+        popup.protocol("WM_DELETE_WINDOW", close_popup)
+        popup.bind("<Return>", lambda _event: apply_rife())
+        popup.bind("<Escape>", lambda _event: close_popup())
 
     # ---------- cache ----------
     def load_full_surface(self, index):
@@ -1277,12 +1750,12 @@ class FrameEditorApp:
 
         return bool(self.retry_file_operation("rename frame file", operation, src))
 
-    def unlink_path_retry(self, path):
+    def unlink_path_retry(self, path, show_error=True):
         def operation():
             path.unlink()
             return True
 
-        return bool(self.retry_file_operation("delete frame file", operation, path))
+        return bool(self.retry_file_operation("delete frame file", operation, path, show_error=show_error))
 
     def copy_path_retry(self, src, dst, action="copy file"):
         def operation():
@@ -1667,9 +2140,10 @@ class FrameEditorApp:
             self.set_status("Open a video before using color tools")
             return
 
-        if self.color_popup is not None and self.color_popup.winfo_exists():
+        if self.active_tool == "color" and self.color_popup is not None and self.color_popup.winfo_exists():
             self.color_popup.lift()
             return
+        self.set_active_tool("color")
 
         popup = Toplevel(self.tk_root)
         popup.title("Color Match")
@@ -1678,8 +2152,7 @@ class FrameEditorApp:
 
         base_image = self.open_image_copy(self.frame_paths[self.current_index], "RGBA", "open color tool frame")
         if base_image is None:
-            self.color_popup = None
-            popup.destroy()
+            self.close_color_tools()
             return
 
         main = Frame(popup, padx=14, pady=12)
@@ -1832,10 +2305,7 @@ class FrameEditorApp:
             update_color_preview()
 
         def close_popup():
-            if self.color_popup is popup:
-                self.color_popup = None
-                self.color_tool_refresh = None
-            popup.destroy()
+            self.close_color_tools()
 
         hue_scale.configure(command=update_color_preview)
         sat_scale.configure(command=update_color_preview)
@@ -1859,10 +2329,17 @@ class FrameEditorApp:
 
     # ---------- background / mask ----------
     def toggle_mask_edit_mode(self):
-        self.mask_edit_mode = not self.mask_edit_mode
+        if self.mask_edit_mode:
+            self.mask_edit_mode = False
+            self.mask_dragging = False
+            self.clear_active_tool("mask")
+            self.set_status("Mask edit off")
+            return
+
+        self.set_active_tool("mask")
+        self.mask_edit_mode = True
         self.mask_dragging = False
-        state = "on" if self.mask_edit_mode else "off"
-        self.set_status(f"Mask edit {state}")
+        self.set_status("Mask edit on")
 
     def set_mask_restore_mode(self):
         self.mask_paint_mode = "restore"
@@ -1873,18 +2350,28 @@ class FrameEditorApp:
         self.set_status("Mask brush erases image")
 
     def toggle_wand_mode(self):
-        self.wand_mode = not self.wand_mode
+        if self.wand_mode:
+            self.wand_mode = False
+            self.wand_dragging = False
+            self.wand_start_pos = None
+            self.wand_drag_base = None
+            self.clear_active_tool("wand")
+            self.set_status("Wand select off")
+            return
+
+        self.set_active_tool("wand")
+        self.wand_mode = True
         self.wand_dragging = False
-        state = "on" if self.wand_mode else "off"
-        if self.wand_mode and self.frames:
+        if self.frames:
             try:
                 self.get_wand_zone_cache(self.current_index)
             except RuntimeError as exc:
                 self.set_status(str(exc))
                 self.wand_mode = False
+                self.clear_active_tool("wand")
                 self.loading_message = ""
                 return
-        self.set_status(f"Wand select {state}")
+        self.set_status("Wand select on")
 
     def clear_wand_selection(self):
         self.wand_selection = None
@@ -2230,7 +2717,7 @@ class FrameEditorApp:
             remove = rembg_module.remove
             new_session = rembg_module.new_session
         except (ImportError, SystemExit):
-            raise RuntimeError("Install rembg with CPU support to use background removal")
+            raise RuntimeError("Install rembg with CPU or GPU support to use background removal")
 
         session = self.rembg_sessions.get(self.rembg_model)
         if session is None:
@@ -2297,9 +2784,10 @@ class FrameEditorApp:
         self.set_status("Removed backgrounds; enable Mask Edit to restore areas", 4000)
 
     def open_rembg_settings(self):
-        if self.rembg_settings_popup is not None and self.rembg_settings_popup.winfo_exists():
+        if self.active_tool == "rembg_settings" and self.rembg_settings_popup is not None and self.rembg_settings_popup.winfo_exists():
             self.rembg_settings_popup.lift()
             return
+        self.set_active_tool("rembg_settings")
 
         popup = Toplevel(self.tk_root)
         popup.title("Background Removal Settings")
@@ -2347,9 +2835,7 @@ class FrameEditorApp:
         buttons.grid(row=6, column=0, columnspan=2, sticky="e", pady=(12, 0))
 
         def close_popup():
-            if self.rembg_settings_popup is popup:
-                self.rembg_settings_popup = None
-            popup.destroy()
+            self.close_rembg_settings()
 
         def apply_settings():
             try:
@@ -2657,10 +3143,15 @@ class FrameEditorApp:
         ]
 
     def get_frame_menu_items(self):
+        can_split_blend = bool(self.frames) and self.current_index >= 3 and (len(self.frames) - self.current_index - 1) >= 3
+        can_loop_blend = len(self.frames) >= 8
         return [
             ("Copy Current Frame", "C", self.copy_frame, bool(self.frames)),
             ("Paste Over Current Frame", "V", self.paste_frame, bool(self.frames)),
             ("Append Frame After Current...", "", self.append_frame_after_current, bool(self.frames)),
+            ("RIFE Double FPS...", "", self.open_rife_interpolation, bool(self.frames)),
+            ("RIFE Blend Selected Split", "", self.rife_blend_selected_split, can_split_blend),
+            ("RIFE Blend Loop Seam", "", self.rife_blend_loop, can_loop_blend),
             ("Export Current Frame...", "", self.export_current_frame, bool(self.frames)),
             ("Delete Current Frame", "Del", self.delete_current_frame, bool(self.frames)),
             ("First Frame", "Home", lambda: self.set_current_index(0), bool(self.frames)),

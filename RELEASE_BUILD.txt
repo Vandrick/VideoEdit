@@ -13,7 +13,7 @@ Use this when you are ready to create a release EXE manually.
 
 3. Install or refresh dependencies:
 
-   .\.venv314\Scripts\python.exe -m pip install --upgrade pip setuptools wheel pyinstaller -r requirements.txt "rembg[cpu]" tbb
+   .\.venv314\Scripts\python.exe -m pip install --upgrade pip setuptools wheel pyinstaller -r requirements.txt "rembg[gpu,cli]" tbb
 
 4. Build the EXE:
 
@@ -27,9 +27,11 @@ Important notes:
 
 - VideoEdit.spec intentionally bundles rembg, onnxruntime, pymatting, and TBB.
 - VideoEdit.spec intentionally excludes the root msvcp140.dll because that DLL conflicts with ONNX Runtime in the packaged app.
+- The default release build is GPU-oriented and installs rembg with GPU and CLI extras. Machines need compatible NVIDIA drivers/CUDA 12 DLLs to use GPU acceleration; otherwise ONNX Runtime may fall back to CPU or report a missing CUDA DLL.
 - If PyInstaller cannot replace an existing EXE, close any running VideoEdit.exe and try again, or build to a new dist folder.
 - The first background-removal run may still download the selected rembg model into the user's model cache.
 - ffmpeg.exe is expected to be available beside the app or on PATH if you are distributing export/open-video support.
+- RIFE interpolation expects the original rife-ncnn-vulkan ZIP layout beside the app, under tools\rife-ncnn-vulkan, or on PATH. The model folders should sit directly beside rife-ncnn-vulkan.exe. RIFE is not bundled into VideoEdit.exe.
 
 Optional FFmpeg local install command:
 

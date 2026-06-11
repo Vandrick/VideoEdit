@@ -43,6 +43,27 @@ Remove-Item $zip -Force
 
 This keeps FFmpeg local to the app folder instead of changing the system PATH.
 
+Optional RIFE frame interpolation
+Frame > RIFE Double FPS uses rife-ncnn-vulkan if it is installed beside the app, in tools\rife-ncnn-vulkan, or on PATH.
+Frame > RIFE Blend Selected Split is enabled when the selected frame has at least 3 frames before it and 3 frames after it.
+Frame > RIFE Blend Loop Seam is enabled when the animation has at least 8 frames. It uses loop-relative frames -3, -2, -1, 2, 3, 4, then replaces the first 3 frames and rebuilds the end seam with the generated transition.
+
+The blend tools stage 3 frames from each side, run RIFE 2x, keep the center generated frames, then lerp color matching from the left reference frame to the right reference frame.
+
+Download:
+https://github.com/nihui/rife-ncnn-vulkan/releases
+
+Extract the portable Windows build exactly as it comes in the ZIP, then either copy that extracted folder beside VideoEdit.exe or place it here:
+
+tools\rife-ncnn-vulkan
+
+The model folders should sit directly beside rife-ncnn-vulkan.exe, for example:
+
+tools\rife-ncnn-vulkan\rife-anime
+tools\rife-ncnn-vulkan\rife-v4.6
+
+The ncnn Vulkan build is portable and does not need CUDA or PyTorch.
+
 Optional background removal
 Background removal uses rembg if it is installed. The editor still works without it, but the Background > Remove BG options will show an install message.
 

@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import sys
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_all
@@ -15,7 +16,7 @@ for package_name in ('rembg', 'onnxruntime', 'pymatting'):
     binaries += package_binaries
     hiddenimports += package_hiddenimports
 
-tbb_bin_dir = Path.cwd() / '.venv314' / 'Library' / 'bin'
+tbb_bin_dir = Path(sys.prefix) / 'Library' / 'bin'
 for dll_name in (
     'libhwloc-15.dll',
     'tbb12.dll',
