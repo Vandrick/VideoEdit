@@ -364,6 +364,7 @@ class FrameEditorApp:
         self.color_popup = None
         self.color_range_popup = None
         self.magic_outline_popup = None
+        self.selection_tools_popup = None
         self.color_range_image_sampler = None
         self.color_reference_image = None
         self.color_reference_label = ""
@@ -447,6 +448,7 @@ class FrameEditorApp:
                     popup.destroy()
             except Exception:
                 pass
+        self.close_selection_tools()
         self.clear_active_tool("color_range")
 
     def close_rembg_settings(self):
@@ -471,6 +473,16 @@ class FrameEditorApp:
                 pass
         self.clear_active_tool("magic_outline")
 
+    def close_selection_tools(self):
+        popup = self.selection_tools_popup
+        self.selection_tools_popup = None
+        if popup is not None:
+            try:
+                if popup.winfo_exists():
+                    popup.destroy()
+            except Exception:
+                pass
+
     def set_active_tool(self, tool_name):
         if self.active_tool == tool_name:
             return True
@@ -479,11 +491,13 @@ class FrameEditorApp:
         if previous == "mask":
             self.mask_edit_mode = False
             self.mask_dragging = False
+            self.close_selection_tools()
         elif previous == "wand":
             self.wand_mode = False
             self.wand_dragging = False
             self.wand_start_pos = None
             self.wand_drag_base = None
+            self.close_selection_tools()
         elif previous == "preview":
             self.close_animation_preview()
         elif previous == "color":
@@ -504,6 +518,7 @@ class FrameEditorApp:
         self.close_color_range_tools()
         self.close_rembg_settings()
         self.close_magic_outline_tools()
+        self.close_selection_tools()
         self.active_tool = None
         self.mask_edit_mode = False
         self.mask_paint_mode = "restore"
@@ -1701,6 +1716,7 @@ class FrameEditorApp:
         self.current_index = index
         self.wand_selection = None
         self.wand_dragging = False
+        self.close_selection_tools()
         self.preview_surface = None
         self.preview_surface_key = None
         self.needs_preview_refresh = True
@@ -2266,8 +2282,10 @@ class FrameEditorApp:
 
         if self.active_tool == "color_range" and self.color_range_popup is not None and self.color_range_popup.winfo_exists():
             self.color_range_popup.lift()
+            self.update_selection_tools_visibility()
             return
         self.set_active_tool("color_range")
+        self.update_selection_tools_visibility()
 
         popup = Toplevel(self.tk_root)
         popup.title("Remove By Color")
@@ -2618,12 +2636,14 @@ class FrameEditorApp:
             self.mask_edit_mode = False
             self.mask_dragging = False
             self.clear_active_tool("mask")
+            self.close_selection_tools()
             self.set_status("Mask edit off")
             return
 
         self.set_active_tool("mask")
         self.mask_edit_mode = True
         self.mask_dragging = False
+        self.update_selection_tools_visibility()
         self.set_status("Mask edit on")
 
     def set_mask_restore_mode(self):
@@ -2641,12 +2661,14 @@ class FrameEditorApp:
             self.wand_start_pos = None
             self.wand_drag_base = None
             self.clear_active_tool("wand")
+            self.close_selection_tools()
             self.set_status("Wand select off")
             return
 
         self.set_active_tool("wand")
         self.wand_mode = True
         self.wand_dragging = False
+        self.update_selection_tools_visibility()
         if self.frames:
             try:
                 self.get_wand_zone_cache(self.current_index)
@@ -2654,6 +2676,7 @@ class FrameEditorApp:
                 self.set_status(str(exc))
                 self.wand_mode = False
                 self.clear_active_tool("wand")
+                self.close_selection_tools()
                 self.loading_message = ""
                 return
         self.set_status("Wand select on")
@@ -2661,7 +2684,138 @@ class FrameEditorApp:
     def clear_wand_selection(self):
         self.wand_selection = None
         self.wand_dragging = False
+        self.close_selection_tools()
+        self.force_redraw()
         self.set_status("Selection cleared")
+
+    def has_selection_pixels(self):
+        if self.wand_selection is None:
+            return False
+        if hasattr(self.wand_selection, "any"):
+            return bool(self.wand_selection.any())
+        return True
+
+    def selection_is_visible(self):
+        return self.has_selection_pixels() and (self.wand_mode or self.mask_edit_mode or self.active_tool == "color_range")
+
+    def update_selection_tools_visibility(self):
+        if self.selection_is_visible():
+            self.open_selection_tools()
+        else:
+            self.close_selection_tools()
+
+    def ensure_selection_available(self):
+        if not self.frames or not self.selection_is_visible():
+            self.set_status("No selection")
+            return False
+
+        full = self.load_full_surface(self.current_index)
+        img_w, img_h = full.get_size()
+        if self.wand_selection.shape != (img_h, img_w):
+            self.set_status("Selection does not match current frame")
+            return False
+        return True
+
+    def transform_wand_selection(self, label, operation):
+        if not self.ensure_selection_available():
+            return False
+        result = operation(self.wand_selection)
+        if result is None:
+            return False
+        self.wand_selection = result
+        pixels = int(result.sum()) if hasattr(result, "sum") else 0
+        self.set_status(f"{label}: {pixels} pixels")
+        self.update_selection_tools_visibility()
+        self.force_redraw()
+        return True
+
+    def grow_wand_selection(self, amount=1):
+        amount = max(1, int(amount))
+        return self.transform_wand_selection("Grew selection", lambda selection: self.dilate_mask(selection, amount))
+
+    def shrink_wand_selection(self, amount=1):
+        amount = max(1, int(amount))
+        return self.transform_wand_selection("Shrank selection", lambda selection: self.erode_mask(selection, amount))
+
+    def invert_wand_selection(self):
+        return self.transform_wand_selection("Inverted selection", lambda selection: ~selection)
+
+    def open_selection_tools(self):
+        if self.selection_tools_popup is not None and self.selection_tools_popup.winfo_exists():
+            self.selection_tools_popup.lift()
+            return
+
+        popup = Toplevel(self.tk_root)
+        popup.title("Selection Tools")
+        popup.resizable(False, False)
+        self.selection_tools_popup = popup
+
+        main = Frame(popup, padx=14, pady=12)
+        main.pack()
+
+        amount_var = StringVar(value="2")
+        status_var = StringVar(value="Grow/shrink use pixels")
+
+        Label(main, text="Amount").grid(row=0, column=0, sticky="w", pady=4)
+        Entry(main, textvariable=amount_var, width=8).grid(row=0, column=1, sticky="ew", padx=(12, 0), pady=4)
+        Label(main, textvariable=status_var, anchor="w").grid(row=1, column=0, columnspan=3, sticky="ew", pady=(4, 8))
+
+        def get_amount():
+            try:
+                amount = int(amount_var.get())
+            except ValueError:
+                status_var.set("Amount must be a whole number")
+                return None
+            if amount < 1:
+                status_var.set("Amount must be at least 1")
+                return None
+            return amount
+
+        def selection_count():
+            if self.wand_selection is None:
+                return 0
+            return int(self.wand_selection.sum()) if hasattr(self.wand_selection, "sum") else 0
+
+        def refresh_status(label):
+            pixels = selection_count()
+            status_var.set(f"{label}: {pixels} pixels")
+
+        def grow_selection():
+            amount = get_amount()
+            if amount is None:
+                return
+            if self.grow_wand_selection(amount):
+                refresh_status("Grew selection")
+            else:
+                status_var.set("No selection")
+
+        def shrink_selection():
+            amount = get_amount()
+            if amount is None:
+                return
+            if self.shrink_wand_selection(amount):
+                refresh_status("Shrank selection")
+            else:
+                status_var.set("No selection")
+
+        def invert_selection():
+            if self.invert_wand_selection():
+                refresh_status("Inverted selection")
+            else:
+                status_var.set("No selection")
+
+        def close_popup():
+            self.close_selection_tools()
+
+        buttons = Frame(main)
+        buttons.grid(row=2, column=0, columnspan=3, sticky="e")
+        Button(buttons, text="Grow", command=grow_selection, width=10).pack(side="left", padx=(0, 8))
+        Button(buttons, text="Shrink", command=shrink_selection, width=10).pack(side="left", padx=(0, 8))
+        Button(buttons, text="Invert", command=invert_selection, width=10).pack(side="left", padx=(0, 8))
+        Button(buttons, text="Close", command=close_popup, width=10).pack(side="left")
+
+        popup.protocol("WM_DELETE_WINDOW", close_popup)
+        popup.bind("<Escape>", lambda _event: close_popup())
 
     def combine_selection_region(self, region, combine_mode="replace"):
         if region is None:
@@ -2675,6 +2829,7 @@ class FrameEditorApp:
             self.wand_selection = None
         else:
             self.wand_selection = region
+        self.update_selection_tools_visibility()
 
     def brush_selection_at(self, mouse, combine_mode="add"):
         pos = self.preview_to_image_pos(mouse)
@@ -2694,7 +2849,12 @@ class FrameEditorApp:
         radius = max(1, int(self.mask_brush_size))
         region = ((xx - x) * (xx - x) + (yy - y) * (yy - y)) <= radius * radius
         self.combine_selection_region(region, combine_mode)
-        self.set_status("Added to selection" if combine_mode == "add" else "Removed from selection")
+        status = {
+            "add": "Added to selection",
+            "subtract": "Removed from selection",
+            "replace": "Selection reset",
+        }.get(combine_mode, "Updated selection")
+        self.set_status(status)
 
     def adjust_mask_brush_size(self, delta):
         sizes = list(range(1, 11)) + [12, 15, 20, 25, 32, 40, 50, 64, 80, 100, 128, 160, 200]
@@ -2726,8 +2886,9 @@ class FrameEditorApp:
             return None
         return x, y
 
-    def paint_mask_at(self, mouse):
-        combine_mode = "add" if self.mask_paint_mode == "restore" else "subtract"
+    def paint_mask_at(self, mouse, combine_mode=None):
+        if combine_mode is None:
+            combine_mode = "add" if self.mask_paint_mode == "restore" else "subtract"
         self.brush_selection_at(mouse, combine_mode)
 
     def get_wand_zone_cache(self, index):
@@ -2951,6 +3112,7 @@ class FrameEditorApp:
             self.wand_selection = base & ~region
         else:
             self.wand_selection = region
+        self.update_selection_tools_visibility()
         self.set_status(f"Wand tolerance {self.wand_tolerance}")
 
     def apply_wand_selection_to_alpha(self, alpha_value):
@@ -3811,6 +3973,7 @@ class FrameEditorApp:
             (mode_label, "M", self.toggle_mask_edit_mode, bool(self.frames)),
             (wand_label, "W", self.toggle_wand_mode, bool(self.frames)),
             ("Remove By Color...", "", self.open_color_range_tools, bool(self.frames)),
+            ("Selection Tools...", "", self.open_selection_tools, self.selection_is_visible()),
             ("Clear Wand Selection", "", self.clear_wand_selection, self.wand_selection is not None),
             ("Fill Current Mask", "", self.fill_current_mask, bool(self.frames)),
             ("Erase Current Mask", "", self.clear_current_mask, bool(self.frames)),
@@ -3919,7 +4082,9 @@ class FrameEditorApp:
             elif self.mask_edit_mode and preview_rect.collidepoint(mouse):
                 self.mask_dragging = True
                 self.mask_paint_mode = "restore"
-                self.paint_mask_at(mouse)
+                mods = pygame.key.get_mods()
+                combine_mode = "add" if mods & (pygame.KMOD_CTRL | pygame.KMOD_META) else "replace"
+                self.paint_mask_at(mouse, combine_mode)
             elif preview_rect.collidepoint(mouse):
                 self.dragging_preview = True
                 self.preview_drag_last = mouse
@@ -4014,6 +4179,12 @@ class FrameEditorApp:
             self.right_next_repeat = now + KEY_REPEAT_DELAY_MS
             if self.frames:
                 self.set_current_index(self.current_index + 1)
+        elif event.key == pygame.K_UP:
+            if self.selection_is_visible():
+                self.grow_wand_selection(1)
+        elif event.key == pygame.K_DOWN:
+            if self.selection_is_visible():
+                self.shrink_wand_selection(1)
         elif event.key == pygame.K_HOME:
             if self.frames:
                 self.set_current_index(0)
@@ -4069,11 +4240,11 @@ class FrameEditorApp:
     # ---------- drawing ----------
     def get_top_bar_hints(self):
         if self.wand_mode:
-            return ["Wand: Click Select", "Shift Add", "Ctrl Subtract", "Insert Restore", "Delete Remove Mask"]
+            return ["Wand: Click Select", "Shift Add", "Ctrl Subtract", "Up/Down Grow/Shrink", "Insert Restore", "Delete Remove Mask"]
         if self.mask_edit_mode:
-            return ["Mask Edit: Left Add", "Right Remove", "Shift Wheel Brush", "Insert Restore", "Delete Remove Mask"]
+            return ["Mask Edit: Left Select", "Ctrl Add", "Right Remove", "Up/Down Grow/Shrink", "Shift Wheel Brush", "Insert Restore", "Delete Remove Mask"]
         if self.active_tool == "color_range":
-            return ["Color Range: Left Low", "Right High", "Insert Restore", "Delete Remove Mask"]
+            return ["Color Range: Left Low", "Right High", "Up/Down Grow/Shrink", "Insert Restore", "Delete Remove Mask"]
         return ["Drop video here to open", "Mouse Wheel Zoom", "Drag Preview Pan", "Left/Right Frame"]
 
     def draw_top_bar(self):
