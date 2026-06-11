@@ -64,6 +64,11 @@ tools\rife-ncnn-vulkan\rife-v4.6
 
 The ncnn Vulkan build is portable and does not need CUDA or PyTorch.
 
+Appending video
+File > Append Video decodes another video or animation and adds its frames after the current loaded frames.
+If the appended video has a different frame size, choose Scale To Fit, Center Crop, or Stretch.
+The current project FPS is kept; the status bar notes when the appended video's source FPS differs.
+
 Optional background removal
 Background removal uses rembg if it is installed. The editor still works without it, but the Background > Remove BG options will show an install message.
 

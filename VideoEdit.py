@@ -684,16 +684,19 @@ class FrameEditorApp:
         except Exception:
             return 30.0
 
-    def extract_frames(self, video_path):
+    def extract_frames_to_dir(self, video_path, output_dir, clear_output=True):
         ffmpeg = self.get_ffmpeg_tool("ffmpeg")
         if not ffmpeg:
             raise FileNotFoundError("ffmpeg.exe was not found")
-        if TEMP_DIR.exists():
-            result = self.retry_file_operation("clear temporary frames", lambda: shutil.rmtree(TEMP_DIR), TEMP_DIR)
-            if result is None and TEMP_DIR.exists():
+        if clear_output and output_dir.exists():
+            result = self.retry_file_operation("clear temporary frames", lambda: shutil.rmtree(output_dir), output_dir)
+            if result is None and output_dir.exists():
                 raise RuntimeError("Could not clear temporary frames")
-        TEMP_DIR.mkdir(parents=True, exist_ok=True)
-        subprocess.run([ffmpeg, "-y", "-i", str(video_path), str(TEMP_DIR / "frame_%06d.png")], check=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.run([ffmpeg, "-y", "-i", str(video_path), str(output_dir / "frame_%06d.png")], check=True)
+
+    def extract_frames(self, video_path):
+        self.extract_frames_to_dir(video_path, TEMP_DIR, clear_output=True)
 
     def force_redraw(self):
         self.screen.fill(BG)
@@ -3096,6 +3099,87 @@ class FrameEditorApp:
         self.reset_after_frame_list_change()
         self.set_status("Appended frame")
 
+    def append_video_frames(self):
+        if not self.frames:
+            self.open_video()
+            return
+        if not self.has_ffmpeg_tools():
+            self.show_ffmpeg_missing_help()
+            return
+
+        path = filedialog.askopenfilename(
+            title="Append video or animation",
+            filetypes=[("Video Files", SUPPORTED_VIDEO_TYPES)],
+        )
+        if not path:
+            return
+
+        video_path = Path(path)
+        if not video_path.exists():
+            self.set_status("File not found")
+            return
+        if video_path.suffix.lower() not in SUPPORTED_VIDEO_EXTS:
+            self.set_status("Unsupported video or animation file")
+            return
+
+        self.close_menus()
+        current_size = self.get_current_frame_size()
+        append_fps = self.detect_fps(video_path)
+        self.loading_message = f"Appending {video_path.name}..."
+        self.force_redraw()
+
+        try:
+            self.extract_frames_to_dir(video_path, APPEND_TEMP_DIR, clear_output=True)
+        except (OSError, subprocess.CalledProcessError, RuntimeError) as exc:
+            self.loading_message = ""
+            self.show_file_error("append video", video_path, exc)
+            return
+
+        append_paths = sorted(APPEND_TEMP_DIR.glob("frame_*.png"))
+        if not append_paths:
+            self.loading_message = ""
+            self.set_status("No frames found in appended video")
+            return
+
+        first = self.open_image_copy(append_paths[0], "RGBA", "open appended video frame")
+        if first is None:
+            self.loading_message = ""
+            return
+        resize_mode = None
+        if first.size != current_size:
+            resize_mode = self.ask_append_resize_mode(first.size, current_size)
+            if resize_mode in (None, "Cancel"):
+                self.loading_message = ""
+                return
+
+        start_index = len(self.frame_paths) + 1
+        self.release_file_caches()
+        for offset, src in enumerate(append_paths):
+            self.loading_message = f"Appending frames... {offset + 1}/{len(append_paths)}"
+            if offset % 5 == 0:
+                self.force_redraw()
+            image = self.open_image_copy(src, "RGBA", "open appended video frame")
+            if image is None:
+                self.loading_message = ""
+                return
+            if image.size != current_size:
+                image = self.resize_image_for_append(image, current_size, resize_mode)
+            dst = TEMP_DIR / f"frame_{start_index + offset:06d}.png"
+            if not self.save_image_retry(image, dst, "save appended video frame"):
+                self.loading_message = ""
+                return
+
+        self.frame_paths = sorted(TEMP_DIR.glob("frame_*.png"))
+        self.frames = [p.name for p in self.frame_paths]
+        self.current_index = start_index - 1
+        self.reset_after_frame_list_change()
+        self.loading_message = ""
+
+        fps_note = ""
+        if abs(append_fps - self.fps) > 0.01:
+            fps_note = f"; appended source was {append_fps:.3f} FPS"
+        self.set_status(f"Appended {len(append_paths)} video frames{fps_note}", 5000)
+
     def delete_current_frame(self):
         if not self.frames:
             return
@@ -3134,6 +3218,7 @@ class FrameEditorApp:
     def get_file_menu_items(self):
         return [
             ("Open Video...", "O", self.open_video, True),
+            ("Append Video...", "", self.append_video_frames, bool(self.frames)),
             ("Reload Source", "Ctrl+R", self.reload_video, self.video_path is not None),
             ("Retarget Size/FPS...", "R", self.retarget_size_fps, bool(self.frames)),
             ("Preview Animation", "P", self.show_animation_preview, bool(self.frames)),
