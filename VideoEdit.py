@@ -8,6 +8,7 @@ import io
 import gc
 import time
 import threading
+import re
 from pathlib import Path
 
 import pygame
@@ -16,6 +17,8 @@ from tkinter import Tk, Toplevel, Label, Entry, Button, Frame, StringVar, Scale,
 
 TEMP_DIR = Path("temp_frames")
 APPEND_TEMP_DIR = TEMP_DIR / "_append_video"
+EXPORT_TEMP_DIR = TEMP_DIR / "_export_frames"
+SMART_EXPORT_DIR = TEMP_DIR / "_smart_export"
 BG = (18, 18, 18)
 PANEL = (28, 28, 28)
 TEXT = (235, 235, 235)
@@ -33,22 +36,174 @@ PREVIEW_PAD = 12
 BASE_THUMB_H = 72
 SELECTED_SCALE = 1.7
 SCROLL_FRICTION = 0.90
-KEY_REPEAT_DELAY_MS = 180
-KEY_REPEAT_INTERVAL_MS = 45
 DRAG_MULTIPLIER = 1.0
-CACHE_RADIUS = 160
+CACHE_RADIUS = 4
+DISK_PRELOAD_BEFORE = 249
+DISK_PRELOAD_AFTER = 250
+MEMORY_PRELOAD_BEFORE = 49
+MEMORY_PRELOAD_AFTER = 50
+PRELOAD_BATCH_SIZE = 10
+MEMORY_PRELOAD_BATCH_SIZE = 10
+MIN_DISK_LOAD_BATCH_SIZE = 12
+MIN_MEMORY_LOAD_BATCH_SIZE = 24
+FULL_CACHE_RADIUS = MEMORY_PRELOAD_AFTER
+VIDEO_FRAME_BUFFER_LIMIT = 500
+ENABLE_FRAME_SWITCH_PROFILING = False
+FRAME_SWITCH_PROFILE_MIN_MS = 4.0
 THUMB_SPACING = 8
 TIMELINE_SIDE_PAD = 20
 FILE_RETRY_COUNT = 12
 FILE_RETRY_DELAY = 0.08
+MAX_EXPORT_STAGING_BYTES = 50 * 1024 * 1024 * 1024
+FULL_EXPORT_WARNING_FRAMES = 1000
+GIF_EXPORT_WARNING_FRAMES = 500
+LARGE_OPERATION_FRAME_LIMIT = 500
+EDITED_FRAME_LIMIT = 500
+RIFE_FRAME_LIMIT = 500
 SUPPORTED_VIDEO_TYPES = ".mp4 .mov .avi .mkv .webm .m4v .gif"
 SUPPORTED_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".gif"}
 DEFAULT_IMAGE_FPS = 16.0
 SUPPORTED_IMAGE_TYPES = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
+SUPPORTED_IMAGE_FILETYPES = [("Image Files", " ".join(f"*{ext}" for ext in sorted(SUPPORTED_IMAGE_TYPES)))]
 FFMPEG_ZIP_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 RIFE_DOWNLOAD_URL = "https://github.com/nihui/rife-ncnn-vulkan/releases"
 RIFE_INPUT_DIR = TEMP_DIR / "_rife_input"
 RIFE_OUTPUT_DIR = TEMP_DIR / "_rife_output"
+
+
+def natural_name_key(path):
+    parts = re.split(r"(\d+)", Path(path).name.casefold())
+    return [int(part) if part.isdigit() else part for part in parts]
+
+
+class VirtualFramePaths:
+    def __init__(self, count, path_func):
+        self.count = int(count)
+        self.path_func = path_func
+
+    def __len__(self):
+        return self.count
+
+    def __bool__(self):
+        return self.count > 0
+
+    def __getitem__(self, item):
+        if isinstance(item, slice):
+            return [self.path_func(index) for index in range(*item.indices(self.count))]
+        if item < 0:
+            item += self.count
+        if item < 0 or item >= self.count:
+            raise IndexError(item)
+        return self.path_func(item)
+
+    def __iter__(self):
+        for index in range(self.count):
+            yield self.path_func(index)
+
+
+class VirtualFrameNames:
+    def __init__(self, count):
+        self.count = int(count)
+
+    def __len__(self):
+        return self.count
+
+    def __bool__(self):
+        return self.count > 0
+
+    def __getitem__(self, item):
+        if isinstance(item, slice):
+            return [self[index] for index in range(*item.indices(self.count))]
+        if item < 0:
+            item += self.count
+        if item < 0 or item >= self.count:
+            raise IndexError(item)
+        return f"frame_{item + 1:06d}.png"
+
+
+class IdentitySourceIndexes:
+    def __init__(self, count):
+        self.count = int(count)
+        self.items = None
+
+    def __len__(self):
+        return len(self.items) if self.items is not None else self.count
+
+    def __bool__(self):
+        return len(self) > 0
+
+    def __getitem__(self, item):
+        if self.items is not None:
+            return self.items[item]
+        if isinstance(item, slice):
+            return list(range(*item.indices(self.count)))
+        if item < 0:
+            item += self.count
+        if item < 0 or item >= self.count:
+            raise IndexError(item)
+        return item
+
+    def __iter__(self):
+        if self.items is not None:
+            return iter(self.items)
+        return iter(range(self.count))
+
+    def materialize(self):
+        if self.items is None:
+            self.items = list(range(self.count))
+        return self.items
+
+    def insert(self, index, value):
+        self.materialize().insert(index, value)
+
+    def pop(self, index=-1):
+        return self.materialize().pop(index)
+
+    def extend(self, values):
+        self.materialize().extend(values)
+
+
+class UniformSizeSequence:
+    def __init__(self, app, count, attr):
+        self.app = app
+        self.count = int(count)
+        self.attr = attr
+
+    def __len__(self):
+        return self.count
+
+    def __bool__(self):
+        return self.count > 0
+
+    def __getitem__(self, item):
+        if isinstance(item, slice):
+            return [getattr(self.app, self.attr)] * len(range(*item.indices(self.count)))
+        if item < 0:
+            item += self.count
+        if item < 0 or item >= self.count:
+            raise IndexError(item)
+        return getattr(self.app, self.attr)
+
+
+class UniformPrefixPositions:
+    def __init__(self, app, count):
+        self.app = app
+        self.count = int(count)
+
+    def __len__(self):
+        return self.count
+
+    def __bool__(self):
+        return self.count > 0
+
+    def __getitem__(self, item):
+        if isinstance(item, slice):
+            return [self[index] for index in range(*item.indices(self.count))]
+        if item < 0:
+            item += self.count
+        if item < 0 or item >= self.count:
+            raise IndexError(item)
+        return TIMELINE_SIDE_PAD + item * (self.app.default_base_thumb_size[0] + THUMB_SPACING)
 
 IS_WINDOWS = sys.platform.startswith("win")
 if IS_WINDOWS:
@@ -315,24 +470,64 @@ class FrameEditorApp:
         self.small_font = pygame.font.SysFont("arial", 14)
 
         self.video_path = None
+        self.media_name = "frames"
+        self.frame_source_type = None
+        self.source_frame_paths = []
+        self.source_frame_indexes = []
+        self.edited_frame_indexes = set()
+        self.frame_buffer_order = []
+        self.frame_buffer_lock = threading.RLock()
+        self.preload_lock = threading.Lock()
+        self.preload_queue = []
+        self.preload_queued = set()
+        self.preload_running = False
+        self.preload_generation = 0
+        self.preload_coordinator_running = False
+        self.loader_disk_batch_size = MIN_DISK_LOAD_BATCH_SIZE
+        self.loader_memory_batch_size = MIN_MEMORY_LOAD_BATCH_SIZE
+        self.loader_next_log_time = 0.0
+        self.loop_next_log_time = time.perf_counter() + 1.0
+        self.loop_frame_count = 0
+        self.loop_last_log_time = time.perf_counter()
+        self.next_frame_profile_status = 0
+        self.last_frame_switch_profile = ""
         self.frames = []
         self.frame_paths = []
         self.current_index = 0
+        self.target_frame = 0
+        self.preview_target_frame = 0
+        self.target_direction = 0
+        self.preview_target_direction = 0
+        self.target_frame_lock = threading.Lock()
         self.fps = 30.0
         self.retarget_width = None
         self.retarget_height = None
         self.retarget_fps = None
         self.preview_popup = None
         self.retarget_popup = None
+        self.jump_popup = None
 
         self.full_cache = {}
+        self.pil_cache = {}
+        self.pygame_cache_pending = []
+        self.pygame_cache_pending_set = set()
+        self.cache_lock = threading.Lock()
+        self.memory_decode_queue = []
+        self.memory_decode_queued = set()
+        self.memory_decode_running = False
         self.thumb_cache = {}
         self.large_thumb_cache = {}
+        self.save_lock = threading.Lock()
+        self.save_queue = {}
+        self.save_versions = {}
+        self.save_running = False
 
         self.base_thumb_sizes = []
         self.large_thumb_sizes = []
         self.prefix_positions = []
         self.timeline_total_width = 0
+        self.default_base_thumb_size = (BASE_THUMB_H, BASE_THUMB_H)
+        self.default_large_thumb_size = (int(BASE_THUMB_H * SELECTED_SCALE), int(BASE_THUMB_H * SELECTED_SCALE))
 
         self.scroll_x = 0.0
         self.scroll_velocity = 0.0
@@ -404,6 +599,8 @@ class FrameEditorApp:
         self.ffmpeg_help_popup = None
         self.rife_help_popup = None
         self.rife_popup = None
+        self.wait_popup = None
+        self.wait_label = None
         self.active_tool = None
 
         self.tk_root = Tk()
@@ -483,6 +680,50 @@ class FrameEditorApp:
             except Exception:
                 pass
 
+    def show_wait_popup(self, message="Please Wait..."):
+        try:
+            if self.wait_popup is not None and self.wait_popup.winfo_exists():
+                if self.wait_label is not None:
+                    self.wait_label.configure(text=message)
+                self.wait_popup.lift()
+            else:
+                popup = Toplevel(self.tk_root)
+                popup.title("Please Wait")
+                popup.resizable(False, False)
+                popup.transient(self.tk_root)
+                self.wait_popup = popup
+                main = Frame(popup, padx=26, pady=18)
+                main.pack()
+                self.wait_label = Label(main, text=message, width=34, anchor="center")
+                self.wait_label.pack()
+                popup.protocol("WM_DELETE_WINDOW", lambda: None)
+            self.tk_root.update_idletasks()
+            self.tk_root.update()
+        except Exception:
+            pass
+
+    def update_wait_popup(self, message=None):
+        try:
+            if self.wait_popup is not None and self.wait_popup.winfo_exists():
+                if message is not None and self.wait_label is not None:
+                    self.wait_label.configure(text=message)
+                self.tk_root.update_idletasks()
+                self.tk_root.update()
+        except Exception:
+            pass
+
+    def hide_wait_popup(self):
+        popup = self.wait_popup
+        self.wait_popup = None
+        self.wait_label = None
+        if popup is not None:
+            try:
+                if popup.winfo_exists():
+                    popup.destroy()
+                self.tk_root.update_idletasks()
+            except Exception:
+                pass
+
     def set_active_tool(self, tool_name):
         if self.active_tool == tool_name:
             return True
@@ -537,6 +778,7 @@ class FrameEditorApp:
             self.wand_zone_cache.clear()
             self.wand_preload_targets = []
             self.wand_preload_running = False
+        self.reset_frame_source_state()
 
     # ---------- ffmpeg ----------
     def app_search_dirs(self):
@@ -768,6 +1010,881 @@ class FrameEditorApp:
     def extract_frames(self, video_path):
         self.extract_frames_to_dir(video_path, TEMP_DIR, clear_output=True)
 
+    def detect_frame_count(self, file_path):
+        try:
+            ffprobe = self.get_ffmpeg_tool("ffprobe")
+            if not ffprobe:
+                return 0
+            cmd = [
+                ffprobe,
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=nb_frames,duration",
+                "-of", "json",
+                str(file_path),
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            data = json.loads(result.stdout)
+            stream = data.get("streams", [{}])[0]
+            value = stream.get("nb_frames")
+            if value and str(value).isdigit():
+                return int(value)
+            duration = float(stream.get("duration") or 0)
+            return max(0, int(round(duration * self.detect_fps(file_path))))
+        except Exception:
+            return 0
+
+    def clear_temp_frames(self):
+        if TEMP_DIR.exists():
+            result = self.retry_file_operation("clear temporary frames", lambda: shutil.rmtree(TEMP_DIR), TEMP_DIR)
+            if result is None and TEMP_DIR.exists():
+                return False
+        TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        return True
+
+    def reset_frame_source_state(self):
+        self.frame_source_type = None
+        self.source_frame_paths = []
+        self.source_frame_indexes = []
+        self.edited_frame_indexes = set()
+        self.frame_buffer_order = []
+        self.set_loader_targets(0)
+        self.clear_preload_queue()
+
+    def frame_temp_path(self, index):
+        return TEMP_DIR / f"frame_{index + 1:06d}.png"
+
+    def set_virtual_frame_list(self, count):
+        self.frame_paths = VirtualFramePaths(count, self.frame_temp_path)
+        self.frames = VirtualFrameNames(count)
+
+    def note_frame_buffer_access(self, index):
+        with self.frame_buffer_lock:
+            if index in self.edited_frame_indexes:
+                return
+            if index in self.frame_buffer_order:
+                self.frame_buffer_order.remove(index)
+            self.frame_buffer_order.append(index)
+            self.prune_frame_buffer()
+
+    def prune_frame_buffer(self, limit=VIDEO_FRAME_BUFFER_LIMIT):
+        with self.frame_buffer_lock:
+            target = self.get_target_frame()
+            keep = set(self.centered_frame_indexes_for_target(target, DISK_PRELOAD_BEFORE, DISK_PRELOAD_AFTER))
+            for index in list(self.frame_buffer_order):
+                if index in self.edited_frame_indexes or index in keep:
+                    continue
+                path = self.frame_temp_path(index)
+                if path.exists():
+                    self.unlink_path_quiet(path)
+                if index in self.frame_buffer_order:
+                    self.frame_buffer_order.remove(index)
+
+            while len(self.frame_buffer_order) > limit:
+                index = max(self.frame_buffer_order, key=lambda item: abs(item - target))
+                if index in self.frame_buffer_order:
+                    self.frame_buffer_order.remove(index)
+                if index in self.edited_frame_indexes:
+                    continue
+                path = self.frame_temp_path(index)
+                if path.exists():
+                    self.unlink_path_quiet(path)
+
+    def remove_frame_from_buffer(self, index):
+        with self.frame_buffer_lock:
+            self.frame_buffer_order = [item for item in self.frame_buffer_order if item != index]
+
+    def set_target_frame(self, index):
+        index = max(0, int(index))
+        with self.target_frame_lock:
+            self.target_direction = 1 if index > self.target_frame else (-1 if index < self.target_frame else self.target_direction)
+            self.target_frame = index
+        self.ensure_preload_coordinator()
+
+    def set_preview_target_frame(self, index):
+        index = max(0, int(index))
+        with self.target_frame_lock:
+            self.preview_target_direction = 1 if index > self.preview_target_frame else (-1 if index < self.preview_target_frame else self.preview_target_direction)
+            self.preview_target_frame = index
+        self.ensure_preload_coordinator()
+
+    def set_loader_targets(self, target, preview=None):
+        target = max(0, int(target))
+        preview = target if preview is None else max(0, int(preview))
+        with self.target_frame_lock:
+            self.target_direction = 1 if target > self.target_frame else (-1 if target < self.target_frame else 0)
+            self.preview_target_direction = 1 if preview > self.preview_target_frame else (-1 if preview < self.preview_target_frame else 0)
+            self.target_frame = target
+            self.preview_target_frame = preview
+        self.ensure_preload_coordinator()
+
+    def get_target_frame(self):
+        with self.target_frame_lock:
+            return self.target_frame
+
+    def get_preview_target_frame(self):
+        with self.target_frame_lock:
+            return self.preview_target_frame
+
+    def get_loader_targets(self):
+        with self.target_frame_lock:
+            return self.target_frame, self.preview_target_frame, self.target_direction, self.preview_target_direction
+
+    def centered_frame_indexes_for_target(self, target, before, after):
+        if not self.frames:
+            return []
+        target = max(0, min(len(self.frames) - 1, int(target)))
+        start = max(0, target - before)
+        end = min(len(self.frames), target + after + 1)
+        return list(range(start, end))
+
+    def prioritized_frame_indexes_for_target(self, target, before, after):
+        indexes = self.centered_frame_indexes_for_target(target, before, after)
+        return sorted(indexes, key=lambda index: (abs(index - target), index < target))
+
+    def visible_timeline_indexes(self):
+        if not self.frames:
+            return []
+        timeline = self.get_timeline_rect()
+        base_step = max(1, self.default_base_thumb_size[0] + THUMB_SPACING)
+        start = max(0, int((self.scroll_x - TIMELINE_SIDE_PAD - 120) / base_step) - 2)
+        end = min(len(self.frames), int((self.scroll_x + timeline.w + 120) / base_step) + 3)
+        return list(range(start, end))
+
+    def timeline_center_index(self):
+        if not self.frames:
+            return 0
+        timeline = self.get_timeline_rect()
+        base_step = max(1, self.default_base_thumb_size[0] + THUMB_SPACING)
+        index = int((self.scroll_x + timeline.w / 2 - TIMELINE_SIDE_PAD) / base_step)
+        return max(0, min(len(self.frames) - 1, index))
+
+    def update_target_from_timeline_view(self):
+        if self.frames:
+            self.set_preview_target_frame(self.timeline_center_index())
+
+    def directional_frame_indexes(self, center, direction, count):
+        if not self.frames or count <= 0:
+            return []
+        center = max(0, min(len(self.frames) - 1, int(center)))
+        if direction > 0:
+            start = center
+            end = min(len(self.frames), center + count)
+            return list(range(start, end))
+        if direction < 0:
+            start = max(0, center - count + 1)
+            return list(range(center, start - 1, -1))
+        return self.prioritized_frame_indexes_for_target(center, count // 2, count - (count // 2) - 1)
+
+    def preload_priority_indexes(self, before=DISK_PRELOAD_BEFORE, after=DISK_PRELOAD_AFTER, target=None, preview_target=None, target_direction=0, preview_direction=0):
+        if target is None or preview_target is None:
+            target, preview_target, target_direction, preview_direction = self.get_loader_targets()
+        ordered = []
+        seen = set()
+
+        def add(index):
+            if 0 <= index < len(self.frame_paths) and index not in seen:
+                ordered.append(index)
+                seen.add(index)
+
+        memory_window = MEMORY_PRELOAD_BEFORE + MEMORY_PRELOAD_AFTER + 1
+        add(target)
+        for index in self.directional_frame_indexes(target, target_direction, memory_window):
+            add(index)
+        add(preview_target)
+        for index in self.directional_frame_indexes(preview_target, preview_direction, memory_window):
+            add(index)
+        if target != preview_target:
+            for index in self.prioritized_frame_indexes_for_target(preview_target, 10, 10):
+                add(index)
+        for index in self.prioritized_frame_indexes_for_target(target, before, after):
+            add(index)
+        if target != preview_target:
+            preview_before = min(before, 80)
+            preview_after = min(after, 80)
+            for index in self.prioritized_frame_indexes_for_target(preview_target, preview_before, preview_after):
+                add(index)
+        return ordered
+
+    def get_background_chunk_size(self):
+        target_fps = self.retarget_fps if self.retarget_fps is not None else self.fps
+        target_fps = max(1.0, float(target_fps or 1.0))
+        return max(PRELOAD_BATCH_SIZE, int(round(target_fps * 2.0)))
+
+    def reset_loader_batch_sizes(self):
+        target_fps = self.get_loader_target_fps()
+        self.loader_disk_batch_size = max(MIN_DISK_LOAD_BATCH_SIZE, int(round(target_fps)))
+        self.loader_memory_batch_size = max(MIN_MEMORY_LOAD_BATCH_SIZE, int(round(target_fps * 2.0)))
+
+    def get_loader_target_fps(self):
+        target_fps = self.retarget_fps if self.retarget_fps is not None else self.fps
+        return max(1.0, float(target_fps or 1.0))
+
+    def tune_loader_batch_size(self, current_size, frame_count, elapsed, minimum):
+        if frame_count <= 0 or elapsed <= 0:
+            return current_size
+        target_fps = self.get_loader_target_fps()
+        throughput = frame_count / elapsed
+        max_size = max(minimum, int(round(target_fps * 2.0)))
+        if throughput < target_fps * 0.85 and elapsed > 0.35:
+            return max(minimum, current_size - max(1, current_size // 4))
+        if throughput > target_fps * 1.25 or elapsed < 0.25:
+            return min(max_size, current_size + max(1, current_size // 4))
+        return current_size
+
+    def frame_ready_on_disk(self, index):
+        if index < 0 or index >= len(self.frame_paths):
+            return False
+        if self.frame_paths[index].exists():
+            return True
+        if self.frame_source_type == "images" and index < len(self.source_frame_paths):
+            return self.source_frame_paths[index] is not None
+        return False
+
+    def frame_ready_in_pil_memory(self, index):
+        with self.cache_lock:
+            return index in self.pil_cache
+
+    def clear_preload_queue(self):
+        with self.preload_lock:
+            self.preload_generation += 1
+            self.preload_queue.clear()
+            self.preload_queued.clear()
+            self.preload_running = False
+            self.preload_coordinator_running = False
+        with self.cache_lock:
+            self.memory_decode_queue.clear()
+            self.memory_decode_queued.clear()
+            self.memory_decode_running = False
+            self.pygame_cache_pending.clear()
+            self.pygame_cache_pending_set.clear()
+
+    def ensure_preload_coordinator(self):
+        if not hasattr(self, "preload_coordinator_running"):
+            return
+        if not self.frames:
+            return
+        with self.preload_lock:
+            if self.preload_coordinator_running:
+                return
+            self.preload_coordinator_running = True
+            generation = self.preload_generation
+        threading.Thread(target=self.preload_coordinator_worker, args=(generation,), daemon=True).start()
+
+    def preload_coordinator_worker(self, generation):
+        while True:
+            with self.preload_lock:
+                if generation != self.preload_generation:
+                    self.preload_coordinator_running = False
+                    return
+
+            if not self.frames:
+                with self.preload_lock:
+                    self.preload_coordinator_running = False
+                return
+
+            target, preview_target, target_direction, preview_direction = self.get_loader_targets()
+            if not (self.left_held or self.right_held):
+                target_direction = 0
+            if not self.dragging_timeline and abs(self.scroll_velocity) <= 0.01:
+                preview_direction = 0
+
+            priority = self.preload_priority_indexes(
+                target=target,
+                preview_target=preview_target,
+                target_direction=target_direction,
+                preview_direction=preview_direction,
+            )
+            self.load_latest_background_batch(priority, target, preview_target, generation)
+
+            target_fps = self.retarget_fps if self.retarget_fps is not None else self.fps
+            target_fps = max(1.0, float(target_fps or 1.0))
+            interval = max(0.012, min(0.04, 0.5 / target_fps)) if self.left_held or self.right_held else 0.25
+            time.sleep(interval)
+
+    def load_latest_background_batch(self, priority, target, preview_target, generation):
+        if not priority:
+            return
+        disk_loaded = 0
+        disk_elapsed = 0.0
+        memory_loaded = 0
+        memory_elapsed = 0.0
+
+        disk_batch = []
+        if self.frame_source_type == "video":
+            disk_priority = []
+            seen_disk = set()
+
+            def add_disk(index):
+                if 0 <= index < len(self.frame_paths) and index not in seen_disk:
+                    disk_priority.append(index)
+                    seen_disk.add(index)
+
+            if not self.frame_ready_on_disk(target):
+                add_disk(target)
+            elif not self.frame_ready_on_disk(preview_target):
+                add_disk(preview_target)
+            for index in priority:
+                add_disk(index)
+
+            for index in disk_priority:
+                if len(disk_batch) >= self.loader_disk_batch_size:
+                    break
+                if index in self.edited_frame_indexes or self.frame_ready_on_disk(index):
+                    continue
+                disk_batch.append(index)
+
+        if disk_batch:
+            started = time.perf_counter()
+            self.extract_video_frame_batch(disk_batch, generation)
+            disk_elapsed = time.perf_counter() - started
+            disk_loaded = len(disk_batch)
+            self.loader_disk_batch_size = self.tune_loader_batch_size(self.loader_disk_batch_size, len(disk_batch), disk_elapsed, MIN_DISK_LOAD_BATCH_SIZE)
+
+        memory_priority = []
+        seen = set()
+
+        def add_memory(index):
+            if 0 <= index < len(self.frame_paths) and index not in seen:
+                memory_priority.append(index)
+                seen.add(index)
+
+        if not self.frame_ready_in_pil_memory(target):
+            add_memory(target)
+        elif not self.frame_ready_in_pil_memory(preview_target):
+            add_memory(preview_target)
+        for index in priority:
+            add_memory(index)
+
+        memory_batch = []
+        for index in memory_priority:
+            if len(memory_batch) >= self.loader_memory_batch_size:
+                break
+            if self.frame_ready_in_pil_memory(index) or not self.frame_ready_for_memory_cache(index):
+                continue
+            memory_batch.append(index)
+
+        if memory_batch:
+            started = time.perf_counter()
+            for index in memory_batch:
+                path = self.get_ready_frame_read_path(index)
+                if path is not None:
+                    self.cache_pil_frame_from_path(index, path, queue_pygame=True)
+                    memory_loaded += 1
+            memory_elapsed = time.perf_counter() - started
+            self.loader_memory_batch_size = self.tune_loader_batch_size(self.loader_memory_batch_size, memory_loaded, memory_elapsed, MIN_MEMORY_LOAD_BATCH_SIZE)
+
+        self.log_loader_stats(target, preview_target, disk_loaded, disk_elapsed, memory_loaded, memory_elapsed)
+
+    def log_loader_stats(self, target, preview_target, disk_loaded, disk_elapsed, memory_loaded, memory_elapsed):
+        now = time.perf_counter()
+        if now < self.loader_next_log_time:
+            return
+        self.loader_next_log_time = now + 1.0
+        _target, _preview, target_direction, preview_direction = self.get_loader_targets()
+        disk_fps = disk_loaded / disk_elapsed if disk_loaded and disk_elapsed > 0 else 0.0
+        memory_fps = memory_loaded / memory_elapsed if memory_loaded and memory_elapsed > 0 else 0.0
+        with self.cache_lock:
+            pil_count = len(self.pil_cache)
+            pending_pygame = len(self.pygame_cache_pending)
+        full_count = len(self.full_cache)
+        print(
+            "loader "
+            f"target={target} preview={preview_target} "
+            f"dir={target_direction}/{preview_direction} "
+            f"disk_batch={self.loader_disk_batch_size} disk_loaded={disk_loaded} disk_fps={disk_fps:.1f} "
+            f"mem_batch={self.loader_memory_batch_size} mem_loaded={memory_loaded} mem_fps={memory_fps:.1f} "
+            f"pil={pil_count} pygame={full_count} pending_pg={pending_pygame}",
+            flush=True,
+        )
+
+    def centered_frame_indexes(self, before, after):
+        return self.centered_frame_indexes_for_target(self.get_target_frame(), before, after)
+
+    def prioritized_centered_frame_indexes(self, before, after):
+        return self.prioritized_frame_indexes_for_target(self.get_target_frame(), before, after)
+
+    def queue_frame_preload(self, index):
+        target = self.get_target_frame()
+        if self.frame_source_type != "video" or self.video_path is None:
+            return
+        if index < 0 or index >= len(self.frame_paths):
+            return
+        if index in self.edited_frame_indexes:
+            return
+        path = self.frame_temp_path(index)
+        if path.exists():
+            self.note_frame_buffer_access(index)
+            return
+
+        with self.preload_lock:
+            if index in self.preload_queued:
+                return
+            self.preload_queue.append(index)
+            self.preload_queued.add(index)
+            self.preload_queue.sort(key=lambda item: (abs(item - target), item < target))
+            if self.preload_running:
+                return
+            self.preload_running = True
+            generation = self.preload_generation
+
+        thread = threading.Thread(target=self.frame_preload_worker, args=(generation,), daemon=True)
+        thread.start()
+
+    def frame_preload_worker(self, generation):
+        while True:
+            with self.preload_lock:
+                if generation != self.preload_generation:
+                    return
+                if not self.preload_queue:
+                    self.preload_running = False
+                    return
+                chunk_size = self.get_background_chunk_size()
+                batch = self.preload_queue[:chunk_size]
+                del self.preload_queue[:chunk_size]
+                for index in batch:
+                    self.preload_queued.discard(index)
+
+            self.extract_video_frame_batch(batch, generation)
+
+    def queue_preload_near_current(self, before=DISK_PRELOAD_BEFORE, after=DISK_PRELOAD_AFTER):
+        if self.frame_source_type != "video" or not self.frames:
+            return
+        target = self.get_target_frame()
+        self.queue_preload_indexes(self.preload_priority_indexes(before, after), target)
+
+    def queue_preload_indexes(self, indexes, target):
+        if self.frame_source_type != "video" or not self.frames:
+            return
+        to_queue = []
+        for index in indexes:
+            if index in self.edited_frame_indexes:
+                continue
+            path = self.frame_temp_path(index)
+            if path.exists():
+                self.note_frame_buffer_access(index)
+            else:
+                to_queue.append(index)
+        if not to_queue:
+            return
+
+        start_thread = False
+        with self.preload_lock:
+            keep_set = set(to_queue)
+            self.preload_queue = [index for index in self.preload_queue if index in keep_set]
+            self.preload_queued = set(self.preload_queue)
+            for index in to_queue:
+                if index in self.preload_queued:
+                    continue
+                self.preload_queue.append(index)
+                self.preload_queued.add(index)
+            rank = {index: position for position, index in enumerate(to_queue)}
+            self.preload_queue.sort(key=lambda item: rank.get(item, len(rank)))
+            if self.preload_queue and not self.preload_running:
+                self.preload_running = True
+                generation = self.preload_generation
+                start_thread = True
+
+        if start_thread:
+            threading.Thread(target=self.frame_preload_worker, args=(generation,), daemon=True).start()
+
+    def queue_memory_decode(self, index):
+        target = self.get_target_frame()
+        if index < 0 or index >= len(self.frame_paths):
+            return
+        if not self.frame_ready_for_memory_cache(index):
+            return
+        with self.cache_lock:
+            if index in self.pil_cache or index in self.memory_decode_queued:
+                return
+            self.memory_decode_queue.append(index)
+            self.memory_decode_queued.add(index)
+            self.memory_decode_queue.sort(key=lambda item: (abs(item - target), item < target))
+            if self.memory_decode_running:
+                return
+            self.memory_decode_running = True
+        generation = self.preload_generation
+        threading.Thread(target=self.memory_decode_worker, args=(generation,), daemon=True).start()
+
+    def queue_memory_decode_near_current(self):
+        if not self.frames:
+            return
+        target = self.get_target_frame()
+        self.queue_memory_decode_indexes(self.preload_priority_indexes(MEMORY_PRELOAD_BEFORE, MEMORY_PRELOAD_AFTER), target)
+
+    def queue_memory_decode_indexes(self, indexes, target):
+        if not self.frames:
+            return
+        to_queue = []
+        for index in indexes:
+            if self.frame_ready_for_memory_cache(index):
+                to_queue.append(index)
+        if not to_queue:
+            return
+
+        start_thread = False
+        with self.cache_lock:
+            keep_set = set(to_queue)
+            self.memory_decode_queue = [index for index in self.memory_decode_queue if index in keep_set]
+            self.memory_decode_queued = set(self.memory_decode_queue)
+            for index in to_queue:
+                if index in self.pil_cache or index in self.memory_decode_queued:
+                    continue
+                self.memory_decode_queue.append(index)
+                self.memory_decode_queued.add(index)
+            rank = {index: position for position, index in enumerate(to_queue)}
+            self.memory_decode_queue.sort(key=lambda item: rank.get(item, len(rank)))
+            if self.memory_decode_queue and not self.memory_decode_running:
+                self.memory_decode_running = True
+                generation = self.preload_generation
+                start_thread = True
+
+        if start_thread:
+            threading.Thread(target=self.memory_decode_worker, args=(generation,), daemon=True).start()
+
+    def memory_decode_worker(self, generation):
+        while True:
+            with self.cache_lock:
+                if generation != self.preload_generation:
+                    self.memory_decode_running = False
+                    return
+                if not self.memory_decode_queue:
+                    self.memory_decode_running = False
+                    return
+                chunk_size = self.get_background_chunk_size()
+                batch = self.memory_decode_queue[:chunk_size]
+                del self.memory_decode_queue[:chunk_size]
+                for index in batch:
+                    self.memory_decode_queued.discard(index)
+
+            for index in batch:
+                path = self.get_ready_frame_read_path(index)
+                if path is None:
+                    continue
+                self.cache_pil_frame_from_path(index, path, queue_pygame=True)
+
+    def get_ready_frame_read_path(self, index):
+        if index < 0 or index >= len(self.frame_paths):
+            return None
+        path = self.frame_paths[index]
+        if path.exists():
+            return path
+        if self.frame_source_type == "images" and index < len(self.source_frame_paths):
+            return self.source_frame_paths[index]
+        return None
+
+    def frame_index_from_temp_path(self, path):
+        path = Path(path)
+        if path.parent != TEMP_DIR or not path.name.startswith("frame_") or path.suffix.lower() != ".png":
+            return None
+        number = path.stem.removeprefix("frame_")
+        if not number.isdigit():
+            return None
+        index = int(number) - 1
+        if index < 0 or index >= len(self.frame_paths):
+            return None
+        return index
+
+    def extract_video_frame(self, index, destination):
+        if self.video_path is None:
+            return False
+        ffmpeg = self.get_ffmpeg_tool("ffmpeg")
+        if not ffmpeg:
+            return False
+        source_index = self.source_frame_indexes[index] if index < len(self.source_frame_indexes) else index
+        timestamp = max(0.0, source_index / max(self.fps, 0.001))
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            subprocess.run(
+                [
+                    ffmpeg,
+                    "-y",
+                    "-ss",
+                    f"{timestamp:.6f}",
+                    "-i",
+                    str(self.video_path),
+                    "-frames:v",
+                    "1",
+                    str(destination),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=True,
+            )
+            return destination.exists()
+        except (OSError, subprocess.CalledProcessError):
+            return False
+
+    def extract_video_frame_batch(self, indexes, generation):
+        if self.video_path is None or not indexes:
+            return
+        ffmpeg = self.get_ffmpeg_tool("ffmpeg")
+        if not ffmpeg:
+            return
+
+        candidates = []
+        for index in indexes:
+            if self.frame_source_type != "video" or self.video_path is None:
+                return
+            if index < 0 or index >= len(self.frame_paths) or index in self.edited_frame_indexes:
+                continue
+            path = self.frame_temp_path(index)
+            if path.exists():
+                self.note_frame_buffer_access(index)
+                continue
+            source_index = self.source_frame_indexes[index] if index < len(self.source_frame_indexes) else index
+            candidates.append((index, source_index))
+
+        if not candidates:
+            return
+
+        candidates.sort(key=lambda item: item[1])
+        groups = []
+        current = [candidates[0]]
+        for item in candidates[1:]:
+            if item[1] == current[-1][1] + 1:
+                current.append(item)
+            else:
+                groups.append(current)
+                current = [item]
+        groups.append(current)
+
+        for group in groups:
+            with self.preload_lock:
+                if generation != self.preload_generation:
+                    return
+            if not self.extract_video_frame_group(group, generation, ffmpeg):
+                for index, _source_index in group:
+                    path = self.frame_temp_path(index)
+                    if not path.exists():
+                        preload_path = TEMP_DIR / f".preload_{generation}_{index + 1:06d}.png"
+                        self.unlink_path_quiet(preload_path)
+                        if self.extract_video_frame(index, preload_path):
+                            self.promote_preloaded_frame(index, preload_path, generation)
+
+    def extract_video_frame_group(self, group, generation, ffmpeg):
+        if not group:
+            return True
+
+        first_index, first_source_index = group[0]
+        batch_dir = TEMP_DIR / f".preload_batch_{generation}_{first_index + 1:06d}"
+        if batch_dir.exists():
+            shutil.rmtree(batch_dir, ignore_errors=True)
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        pattern = batch_dir / "frame_%06d.png"
+        timestamp = max(0.0, first_source_index / max(self.fps, 0.001))
+
+        try:
+            subprocess.run(
+                [
+                    ffmpeg,
+                    "-y",
+                    "-ss",
+                    f"{timestamp:.6f}",
+                    "-i",
+                    str(self.video_path),
+                    "-frames:v",
+                    str(len(group)),
+                    str(pattern),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=True,
+            )
+
+            ok = True
+            for offset, (index, _source_index) in enumerate(group, start=1):
+                output_path = batch_dir / f"frame_{offset:06d}.png"
+                if not output_path.exists() or not self.promote_preloaded_frame(index, output_path, generation):
+                    ok = False
+            return ok
+        except (OSError, subprocess.CalledProcessError):
+            return False
+        finally:
+            if batch_dir.exists():
+                shutil.rmtree(batch_dir, ignore_errors=True)
+
+    def promote_preloaded_frame(self, index, preload_path, generation):
+        with self.preload_lock:
+            still_current = generation == self.preload_generation
+        if not still_current:
+            self.unlink_path_quiet(preload_path)
+            return False
+
+        path = self.frame_temp_path(index)
+        if path.exists():
+            self.unlink_path_quiet(preload_path)
+            self.note_frame_buffer_access(index)
+            return True
+        if not self.rename_path_quiet(preload_path, path):
+            self.unlink_path_quiet(preload_path)
+            return False
+
+        self.note_frame_buffer_access(index)
+        self.cache_pil_frame_from_path(index, path, queue_pygame=True)
+        return True
+
+    def resolve_frame_read_path(self, path, allow_async=False):
+        path = Path(path)
+        index = self.frame_index_from_temp_path(path)
+        if index is None:
+            return path, False
+
+        if path.exists():
+            if self.frame_source_type == "video" and index not in self.edited_frame_indexes:
+                self.note_frame_buffer_access(index)
+            return path, False
+
+        if self.frame_source_type == "images" and index < len(self.source_frame_paths):
+            source = self.source_frame_paths[index]
+            if source is not None:
+                return source, False
+
+        if self.frame_source_type == "video":
+            if allow_async:
+                self.queue_frame_preload(index)
+                return None, False
+            if self.extract_video_frame(index, path):
+                if index not in self.edited_frame_indexes:
+                    self.note_frame_buffer_access(index)
+                return path, False
+
+        return path, False
+
+    def make_black_frame_surface(self):
+        width = self.retarget_width or self.default_base_thumb_size[0] or 320
+        height = self.retarget_height or self.default_base_thumb_size[1] or 180
+        surf = pygame.Surface((max(1, int(width)), max(1, int(height))), pygame.SRCALPHA).convert_alpha()
+        surf.fill((0, 0, 0, 255))
+        return surf
+
+    def cache_pil_frame(self, index, image, queue_pygame=True):
+        if index < 0 or index >= len(self.frame_paths):
+            return
+        cached = image.convert("RGBA").copy()
+        with self.cache_lock:
+            self.pil_cache[index] = cached
+            if queue_pygame and index not in self.pygame_cache_pending_set:
+                self.pygame_cache_pending.append(index)
+                self.pygame_cache_pending_set.add(index)
+
+    def cache_pil_frame_from_path(self, index, path, queue_pygame=True):
+        try:
+            with Image.open(path) as image:
+                self.cache_pil_frame(index, image, queue_pygame=queue_pygame)
+            return True
+        except Exception:
+            return False
+
+    def get_cached_pil_frame(self, index, mode="RGBA"):
+        with self.cache_lock:
+            image = self.pil_cache.get(index)
+            if image is None:
+                return None
+            cached = image.copy()
+        return cached.convert(mode) if mode else cached
+
+    def pygame_surface_from_pil(self, image):
+        image = image.convert("RGBA")
+        return pygame.image.frombuffer(image.tobytes(), image.size, "RGBA").convert_alpha()
+
+    def process_pending_pygame_cache(self, limit=MEMORY_PRELOAD_BATCH_SIZE):
+        processed = 0
+        while processed < limit:
+            with self.cache_lock:
+                if not self.pygame_cache_pending:
+                    return
+                index = self.pygame_cache_pending.pop(0)
+                self.pygame_cache_pending_set.discard(index)
+                image = self.pil_cache.get(index)
+                if image is not None:
+                    image = image.copy()
+            if image is None or index < 0 or index >= len(self.frame_paths):
+                continue
+            if index not in self.centered_frame_indexes_for_target(self.get_target_frame(), MEMORY_PRELOAD_BEFORE, MEMORY_PRELOAD_AFTER):
+                continue
+            self.full_cache[index] = self.pygame_surface_from_pil(image)
+            self.thumb_cache.pop(index, None)
+            self.large_thumb_cache.pop(index, None)
+            if index == self.current_index:
+                self.preview_surface = None
+                self.preview_surface_key = None
+                self.needs_preview_refresh = True
+            processed += 1
+        self.prune_full_cache()
+
+    def promote_pil_frame_to_pygame(self, index):
+        if index in self.full_cache:
+            return True
+        with self.cache_lock:
+            image = self.pil_cache.get(index)
+            if image is not None:
+                image = image.copy()
+                self.pygame_cache_pending_set.discard(index)
+                self.pygame_cache_pending = [item for item in self.pygame_cache_pending if item != index]
+        if image is None:
+            return False
+        self.full_cache[index] = self.pygame_surface_from_pil(image)
+        self.thumb_cache.pop(index, None)
+        self.large_thumb_cache.pop(index, None)
+        if index == self.current_index:
+            self.preview_surface = None
+            self.preview_surface_key = None
+            self.needs_preview_refresh = True
+        self.prune_full_cache()
+        return True
+
+    def enqueue_frame_save(self, index, image):
+        path = self.frame_paths[index]
+        with self.save_lock:
+            version = self.save_versions.get(index, 0) + 1
+            self.save_versions[index] = version
+            self.save_queue[index] = (version, image.convert("RGBA").copy(), path)
+            if self.save_running:
+                return
+            self.save_running = True
+        threading.Thread(target=self.frame_save_worker, daemon=True).start()
+
+    def frame_save_worker(self):
+        while True:
+            with self.save_lock:
+                if not self.save_queue:
+                    self.save_running = False
+                    return
+                index, (version, image, path) = self.save_queue.popitem()
+
+            latest_version = self.save_versions.get(index)
+            if version != latest_version:
+                continue
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                image.save(path)
+                self.mark_edited_frame_path(path)
+            except Exception:
+                set_status_error_safe(self, "Could not save frame")
+
+    def wait_for_pending_frame_saves(self):
+        while True:
+            with self.save_lock:
+                done = not self.save_running and not self.save_queue
+            if done:
+                return
+            time.sleep(0.01)
+
+    def cleanup_transient_frame(self, path, transient):
+        if not transient:
+            return
+        index = self.frame_index_from_temp_path(path)
+        if index is not None and index in self.edited_frame_indexes:
+            return
+        self.unlink_path_retry(Path(path), show_error=False)
+
+    def mark_edited_frame_path(self, path):
+        index = self.frame_index_from_temp_path(path)
+        if index is not None:
+            self.edited_frame_indexes.add(index)
+            self.remove_frame_from_buffer(index)
+
     def force_redraw(self):
         self.screen.fill(BG)
         self.draw_top_bar()
@@ -794,17 +1911,28 @@ class FrameEditorApp:
         self.loading_message = f"Opening {path.name}..."
         self.force_redraw()
 
+        if not self.clear_temp_frames():
+            self.loading_message = ""
+            return
+
         self.video_path = path
+        self.media_name = path.stem
+        self.frame_source_type = "video"
         self.loading_message = "Reading video info..."
         self.force_redraw()
         self.fps = self.detect_fps(self.video_path)
-        self.loading_message = "Extracting frames..."
-        self.force_redraw()
-        self.extract_frames(self.video_path)
-
-        self.frame_paths = sorted(TEMP_DIR.glob("frame_*.png"))
-        self.frames = [p.name for p in self.frame_paths]
+        self.reset_loader_batch_sizes()
+        frame_count = self.detect_frame_count(self.video_path)
+        if frame_count <= 0:
+            self.loading_message = ""
+            self.set_status("Could not count video frames", 5000)
+            return
+        self.source_frame_indexes = IdentitySourceIndexes(frame_count)
+        self.source_frame_paths = []
+        self.edited_frame_indexes = set()
+        self.set_virtual_frame_list(frame_count)
         self.current_index = 0
+        self.set_loader_targets(self.current_index)
         self.initialize_retarget_settings()
         self.scroll_x = 0.0
         self.scroll_velocity = 0.0
@@ -824,12 +1952,13 @@ class FrameEditorApp:
 
         self.loading_message = "Building timeline..."
         self.force_redraw()
+        self.promote_pil_frame_to_pygame(self.current_index)
         self.prime_caches_near_current()
         self.rebuild_timeline_metrics()
         self.center_selected()
         self.schedule_wand_zone_preload()
         self.loading_message = ""
-        self.set_status(f"Opened {path.name}")
+        self.set_status(f"Opened {path.name} lazily ({frame_count} frames)", 5000)
 
     def open_video(self):
         self.loading_message = "Opening video..."
@@ -859,26 +1988,89 @@ class FrameEditorApp:
         self.loading_message = f"Opening {path.name}..."
         self.force_redraw()
 
-        if TEMP_DIR.exists():
-            result = self.retry_file_operation("clear temporary frames", lambda: shutil.rmtree(TEMP_DIR), TEMP_DIR)
-            if result is None and TEMP_DIR.exists():
-                self.loading_message = ""
-                return
-        TEMP_DIR.mkdir(parents=True, exist_ok=True)
-
-        image = self.open_image_copy(path, "RGBA", "open image")
-        if image is None:
-            self.loading_message = ""
-            return
-        if not self.save_image_retry(image, TEMP_DIR / "frame_000001.png", "save image frame"):
+        if not self.clear_temp_frames():
             self.loading_message = ""
             return
 
         self.video_path = None
+        self.media_name = path.stem
+        self.frame_source_type = "images"
+        self.source_frame_paths = [path]
+        self.source_frame_indexes = []
+        self.edited_frame_indexes = set()
         self.fps = DEFAULT_IMAGE_FPS
-        self.frame_paths = sorted(TEMP_DIR.glob("frame_*.png"))
-        self.frames = [p.name for p in self.frame_paths]
+        self.reset_loader_batch_sizes()
+        self.set_virtual_frame_list(1)
         self.current_index = 0
+        self.set_loader_targets(self.current_index)
+        self.initialize_retarget_settings()
+        self.scroll_x = 0.0
+        self.scroll_velocity = 0.0
+        self.preview_zoom = 1.0
+        self.preview_offset = [0.0, 0.0]
+
+        self.full_cache.clear()
+        self.thumb_cache.clear()
+        self.large_thumb_cache.clear()
+        with self.wand_zone_lock:
+            self.wand_zone_cache.clear()
+            self.wand_preload_targets = []
+        self.base_thumb_sizes = []
+        self.large_thumb_sizes = []
+        self.prefix_positions = []
+        self.timeline_total_width = 0
+        self.default_base_thumb_size = (BASE_THUMB_H, BASE_THUMB_H)
+        self.default_large_thumb_size = (int(BASE_THUMB_H * SELECTED_SCALE), int(BASE_THUMB_H * SELECTED_SCALE))
+        self.preview_surface = None
+        self.preview_surface_key = None
+        self.needs_preview_refresh = True
+
+        self.prime_caches_near_current()
+        self.rebuild_timeline_metrics()
+        self.center_selected()
+        self.schedule_wand_zone_preload()
+        self.loading_message = ""
+        self.set_status(f"Opened image at {DEFAULT_IMAGE_FPS:g} FPS")
+
+    def get_image_folder_paths(self, folder):
+        folder = Path(folder)
+        return sorted(
+            (path for path in folder.iterdir() if path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_TYPES),
+            key=natural_name_key,
+        )
+
+    def open_image_folder_path(self, folder):
+        folder = Path(folder)
+        if not folder.exists() or not folder.is_dir():
+            self.set_status("Folder not found")
+            return
+
+        image_paths = self.get_image_folder_paths(folder)
+        if not image_paths:
+            self.set_status("Folder has no supported images")
+            return
+
+        self.close_menus()
+        self.reset_tools_for_new_media()
+        self.loading_message = f"Opening {folder.name}..."
+        self.force_redraw()
+
+        if not self.clear_temp_frames():
+            self.loading_message = ""
+            return
+
+        self.video_path = None
+        self.media_name = folder.name
+        self.frame_source_type = "images"
+        self.source_frame_paths = image_paths
+        self.source_frame_indexes = []
+        self.edited_frame_indexes = set()
+        self.fps = DEFAULT_IMAGE_FPS
+        self.reset_loader_batch_sizes()
+        total = len(image_paths)
+        self.set_virtual_frame_list(total)
+        self.current_index = 0
+        self.set_loader_targets(self.current_index)
         self.initialize_retarget_settings()
         self.scroll_x = 0.0
         self.scroll_velocity = 0.0
@@ -904,13 +2096,61 @@ class FrameEditorApp:
         self.center_selected()
         self.schedule_wand_zone_preload()
         self.loading_message = ""
-        self.set_status(f"Opened image at {DEFAULT_IMAGE_FPS:g} FPS")
+        self.set_status(f"Opened {total} images from {folder.name}")
+
+    def open_image_folder(self):
+        self.loading_message = "Opening image folder..."
+        self.force_redraw()
+
+        folder = filedialog.askdirectory(title="Open image folder")
+        if not folder:
+            self.loading_message = ""
+            return
+
+        self.open_image_folder_path(folder)
 
     def reload_video(self):
         if self.video_path is None:
             self.set_status("No source video to reload")
             return
         self.open_video_path(self.video_path)
+
+    def can_reload_current_frame_from_source(self):
+        if not self.frames:
+            return False
+        if self.frame_source_type == "video" and self.video_path is not None:
+            return True
+        if self.frame_source_type == "images" and self.current_index < len(self.source_frame_paths):
+            return self.source_frame_paths[self.current_index] is not None
+        return False
+
+    def reload_current_frame_from_source(self):
+        if not self.can_reload_current_frame_from_source():
+            self.set_status("Current frame has no source to reload")
+            return
+
+        index = self.current_index
+        path = self.frame_paths[index]
+        self.wait_for_pending_frame_saves()
+        self.release_file_caches()
+        self.unlink_path_retry(path, show_error=False)
+        self.edited_frame_indexes.discard(index)
+        self.remove_frame_from_buffer(index)
+
+        if self.frame_source_type == "video":
+            self.show_wait_popup("Please Wait... Reloading frame")
+            try:
+                if not self.extract_video_frame(index, path):
+                    self.set_status("Could not reload frame from source")
+                    return
+                self.note_frame_buffer_access(index)
+            finally:
+                self.hide_wait_popup()
+
+        self.invalidate_frame_cache(index)
+        self.prime_caches_near_current()
+        self.rebuild_timeline_metrics()
+        self.set_status(f"Reloaded frame {index} from source")
 
     def make_even(self, value):
         value = max(2, int(value))
@@ -923,7 +2163,9 @@ class FrameEditorApp:
         image = self.open_image_copy(self.frame_paths[index], "RGBA", "read frame size")
         if image is None:
             return None
-        return image.size
+        size = image.size
+        image.close()
+        return size
 
     def initialize_retarget_settings(self):
         size = self.get_current_frame_size()
@@ -1003,6 +2245,7 @@ class FrameEditorApp:
             self.retarget_width = self.make_even(new_width)
             self.retarget_height = self.make_even(new_height)
             self.retarget_fps = float(new_fps)
+            self.reset_loader_batch_sizes()
             self.set_status(f"Retarget {self.retarget_width}x{self.retarget_height} @ {self.retarget_fps:.3f} FPS")
             close_popup()
 
@@ -1042,49 +2285,28 @@ class FrameEditorApp:
 
         popup.protocol("WM_DELETE_WINDOW", close_preview)
 
-        preview_frames = []
-        try:
-            for frame_number, path in enumerate(self.frame_paths, start=1):
-                if self.preview_popup is not popup or not popup.winfo_exists():
-                    return
-
-                image_label.configure(text=f"Preparing preview {frame_number}/{len(self.frame_paths)}")
-                popup.update_idletasks()
-                popup.update()
-
-                image = self.open_image_copy(path, "RGB", "open preview frame")
-                if image is None:
-                    close_preview()
-                    return
-                image = image.resize((width, height), Image.Resampling.LANCZOS)
-                preview_frames.append(ImageTk.PhotoImage(image))
-        except MemoryError:
-            close_preview()
-            self.set_status("Preview too large to fit in memory")
-            return
-
-        if not preview_frames:
-            close_preview()
-            self.set_status("No frames available for preview")
-            return
-
-        image_label.configure(text="", image=preview_frames[0])
-        image_label.image = preview_frames[0]
-        image_label.preview_frames = preview_frames
         start_time = time.perf_counter()
-        frame_state = {"index": 0}
+        frame_state = {"index": None}
 
         def draw_next_frame():
             if self.preview_popup is not popup or not popup.winfo_exists():
                 return
 
-            frame_count = len(preview_frames)
+            frame_count = len(self.frame_paths)
             clip_duration = frame_count / fps
             elapsed = (time.perf_counter() - start_time) % clip_duration
             target_index = int(elapsed * fps) % frame_count
 
             if target_index != frame_state["index"]:
-                photo = preview_frames[target_index]
+                image = self.open_image_copy(self.frame_paths[target_index], "RGB", "open preview frame")
+                if image is None:
+                    close_preview()
+                    return
+                try:
+                    image = image.resize((width, height), Image.Resampling.LANCZOS)
+                    photo = ImageTk.PhotoImage(image)
+                finally:
+                    image.close()
                 image_label.configure(image=photo)
                 image_label.image = photo
                 frame_state["index"] = target_index
@@ -1097,11 +2319,449 @@ class FrameEditorApp:
         draw_next_frame()
         self.set_status("Preview playing")
 
+    def clear_work_folder(self, folder, label):
+        if folder.exists():
+            result = self.retry_file_operation(label, lambda: shutil.rmtree(folder), folder)
+            if result is None and folder.exists():
+                return False
+        folder.mkdir(parents=True, exist_ok=True)
+        return True
+
+    def stage_all_frames_for_export(self, output_dir, mode="RGBA"):
+        if not self.check_export_staging_size(len(self.frame_paths), "full video export"):
+            return False
+        if not self.clear_work_folder(output_dir, "clear export frames"):
+            return False
+        total = len(self.frame_paths)
+        for i, path in enumerate(self.frame_paths, start=1):
+            self.loading_message = f"Staging frames... {i}/{total}"
+            if i == 1 or i % 5 == 0:
+                self.update_wait_popup(self.loading_message)
+                self.force_redraw()
+            image = self.open_image_copy(path, mode, "open frame for export staging")
+            if image is None:
+                return False
+            destination = output_dir / f"frame_{i:06d}.png"
+            try:
+                if not self.save_image_retry(image, destination, "stage export frame"):
+                    return False
+            finally:
+                image.close()
+        return True
+
+    def estimate_staging_bytes(self, frame_count):
+        settings = self.get_retarget_settings()
+        if settings is None:
+            return 0
+        width, height, _fps = settings
+        return int(width) * int(height) * 4 * max(0, int(frame_count))
+
+    def format_bytes(self, value):
+        units = ("B", "KB", "MB", "GB", "TB")
+        amount = float(value)
+        for unit in units:
+            if amount < 1024 or unit == units[-1]:
+                return f"{amount:.1f} {unit}" if unit != "B" else f"{int(amount)} B"
+            amount /= 1024
+
+    def check_export_staging_size(self, frame_count, label):
+        estimate = self.estimate_staging_bytes(frame_count)
+        if estimate <= MAX_EXPORT_STAGING_BYTES:
+            return True
+        message = (
+            f"{label} would stage about {self.format_bytes(estimate)} of raw frame data.\n\n"
+            "Export cancelled to avoid filling the disk."
+        )
+        self.loading_message = ""
+        self.set_status("Export cancelled; staging would be too large", 6000)
+        try:
+            messagebox.showwarning("Export Too Large", message, parent=self.tk_root)
+        except Exception:
+            pass
+        return False
+
+    def check_rife_staging_size(self, multiplier):
+        input_frames = len(self.frame_paths)
+        output_frames = max(0, input_frames * int(multiplier))
+        # RIFE stages input PNGs, writes output PNGs, then VideoEdit copies output into temp_frames.
+        estimate = self.estimate_staging_bytes(input_frames + output_frames + output_frames)
+        if estimate <= MAX_EXPORT_STAGING_BYTES:
+            return True
+        message = (
+            f"RIFE would stage about {self.format_bytes(estimate)} of raw frame data "
+            f"for {input_frames} input frames and about {output_frames} output frames.\n\n"
+            "RIFE cancelled to avoid filling the disk."
+        )
+        self.set_status("RIFE cancelled; staging would be too large", 6000)
+        try:
+            messagebox.showwarning("RIFE Too Large", message, parent=self.tk_root)
+        except Exception:
+            pass
+        return False
+
+    def confirm_large_full_export(self):
+        if len(self.frame_paths) <= FULL_EXPORT_WARNING_FRAMES:
+            return True
+        estimate = self.estimate_staging_bytes(len(self.frame_paths))
+        message = (
+            f"Smart segmented export is not available for this edit, so VideoEdit would render all "
+            f"{len(self.frame_paths)} frames.\n\n"
+            f"Estimated raw staging size: {self.format_bytes(estimate)}.\n\n"
+            "This may take a long time and use a lot of disk space and memory. Continue?"
+        )
+        try:
+            return messagebox.askyesno("Large Full Export", message, parent=self.tk_root)
+        except Exception:
+            return False
+
+    def confirm_large_gif_export(self):
+        if len(self.frame_paths) <= GIF_EXPORT_WARNING_FRAMES:
+            return True
+        width, height, output_fps = self.get_retarget_settings()
+        message = (
+            f"GIF export is best for short loops. This export has {len(self.frame_paths)} frames "
+            f"at {width}x{height} and {output_fps:.3f} FPS.\n\n"
+            "It may take a long time and create a very large GIF. Continue?"
+        )
+        try:
+            return messagebox.askyesno("Large GIF Export", message, parent=self.tk_root)
+        except Exception:
+            return False
+
+    def has_video_frame_changes(self):
+        if self.video_path is None or self.frame_source_type != "video":
+            return True
+        if self.edited_frame_indexes:
+            return True
+        if len(self.source_frame_indexes) != len(self.frame_paths):
+            return True
+        return any(source_index != index for index, source_index in enumerate(self.source_frame_indexes))
+
+    def confirm_unmodified_video_export(self):
+        if self.has_video_frame_changes():
+            return True
+        message = (
+            "No frames have been pasted, edited, inserted, or deleted.\n\n"
+            "The exported MP4 would match the original video. Continue and save a copy anyway?"
+        )
+        try:
+            return messagebox.askyesno("No Frame Changes", message, parent=self.tk_root)
+        except Exception:
+            return True
+
+    def can_smart_export_video(self):
+        if self.video_path is None or self.frame_source_type != "video":
+            return False
+        if not self.has_video_frame_changes():
+            return False
+        if len(self.source_frame_indexes) != len(self.frame_paths) or not self.source_frame_indexes:
+            return False
+        if any(
+            source_index <= previous
+            for previous, source_index in zip(self.source_frame_indexes, self.source_frame_indexes[1:])
+        ):
+            return False
+        width, height, output_fps = self.get_retarget_settings()
+        source_size = self.get_current_frame_size()
+        if source_size is None:
+            return False
+        source_w = self.make_even(source_size[0])
+        source_h = self.make_even(source_size[1])
+        if width != source_w or height != source_h:
+            return False
+        if abs(output_fps - self.fps) > 0.01:
+            return False
+        return True
+
+    def get_video_keyframe_indexes(self):
+        ffprobe = self.get_ffmpeg_tool("ffprobe")
+        if not ffprobe or self.video_path is None:
+            return []
+        try:
+            result = subprocess.run(
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-skip_frame",
+                    "nokey",
+                    "-show_entries",
+                    "frame=best_effort_timestamp_time,pkt_pts_time",
+                    "-of",
+                    "json",
+                    str(self.video_path),
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            data = json.loads(result.stdout)
+        except Exception:
+            return []
+
+        indexes = {0}
+        for frame in data.get("frames", []):
+            value = frame.get("best_effort_timestamp_time") or frame.get("pkt_pts_time")
+            if value is None:
+                continue
+            try:
+                indexes.add(max(0, int(round(float(value) * self.fps))))
+            except (TypeError, ValueError):
+                continue
+        return sorted(index for index in indexes if index >= 0)
+
+    def smart_changed_output_indexes(self):
+        changed = {index for index in self.edited_frame_indexes if 0 <= index < len(self.frame_paths)}
+        if not self.source_frame_indexes:
+            return sorted(changed)
+
+        if self.source_frame_indexes[0] != 0:
+            changed.add(0)
+
+        for index in range(1, len(self.source_frame_indexes)):
+            if self.source_frame_indexes[index] != self.source_frame_indexes[index - 1] + 1:
+                changed.add(index)
+                changed.add(index - 1)
+
+        original_last = self.source_frame_indexes[-1]
+        expected_last = self.detect_frame_count(self.video_path) - 1
+        if expected_last >= 0 and original_last != expected_last:
+            changed.add(len(self.source_frame_indexes) - 1)
+
+        return sorted(index for index in changed if 0 <= index < len(self.frame_paths))
+
+    def smart_output_index_for_source_at_or_after(self, source_index):
+        for index, mapped_source in enumerate(self.source_frame_indexes):
+            if mapped_source >= source_index:
+                return index
+        return len(self.source_frame_indexes)
+
+    def smart_export_ranges(self):
+        edits = self.smart_changed_output_indexes()
+        if not edits:
+            return []
+        keyframes = self.get_video_keyframe_indexes()
+
+        expanded = []
+        for index in edits:
+            source_index = self.source_frame_indexes[index]
+            source_start = 0
+            source_end = self.source_frame_indexes[-1] + 1
+            for key in keyframes:
+                if key <= source_index:
+                    source_start = key
+                elif key > source_index:
+                    source_end = key
+                    break
+            start = self.smart_output_index_for_source_at_or_after(source_start)
+            end = self.smart_output_index_for_source_at_or_after(source_end)
+            if end <= start:
+                end = min(len(self.frame_paths), start + 1)
+            expanded.append((start, end))
+
+        expanded.sort()
+        merged = []
+        for start, end in expanded:
+            if not merged or start > merged[-1][1]:
+                merged.append([start, end])
+            else:
+                merged[-1][1] = max(merged[-1][1], end)
+        return [(start, min(end, len(self.frame_paths))) for start, end in merged]
+
+    def write_concat_list(self, segment_paths, list_path):
+        def escaped(path):
+            return str(Path(path).resolve()).replace("\\", "/").replace("'", "'\\''")
+
+        def operation():
+            with open(list_path, "w", encoding="utf-8") as file:
+                for path in segment_paths:
+                    file.write(f"file '{escaped(path)}'\n")
+            return True
+
+        return bool(self.retry_file_operation("write concat list", operation, list_path))
+
+    def run_ffmpeg_segment_copy(self, ffmpeg, start_frame, end_frame, output_path):
+        start_time = start_frame / max(self.fps, 0.001)
+        duration = max(0.001, (end_frame - start_frame) / max(self.fps, 0.001))
+        subprocess.run(
+            [
+                ffmpeg,
+                "-y",
+                "-ss",
+                f"{start_time:.6f}",
+                "-i",
+                str(self.video_path),
+                "-t",
+                f"{duration:.6f}",
+                "-map",
+                "0:v:0",
+                "-an",
+                "-c:v",
+                "copy",
+                str(output_path),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+
+    def run_ffmpeg_output_range_copy(self, ffmpeg, start_index, end_index, output_path):
+        if start_index >= end_index:
+            return
+        source_start = self.source_frame_indexes[start_index]
+        source_end = self.source_frame_indexes[end_index - 1] + 1
+        self.run_ffmpeg_segment_copy(ffmpeg, source_start, source_end, output_path)
+
+    def stage_frame_range_for_export(self, start_frame, end_frame, output_dir):
+        if not self.check_export_staging_size(end_frame - start_frame, "smart edited segment"):
+            return False
+        if not self.clear_work_folder(output_dir, "clear smart export frames"):
+            return False
+        total = max(0, end_frame - start_frame)
+        for offset, index in enumerate(range(start_frame, end_frame), start=1):
+            self.loading_message = f"Staging edited range... {offset}/{total}"
+            if offset == 1 or offset % 5 == 0:
+                self.update_wait_popup(self.loading_message)
+                self.force_redraw()
+            image = self.open_image_copy(self.frame_paths[index], "RGBA", "open frame for smart export")
+            if image is None:
+                return False
+            destination = output_dir / f"frame_{offset:06d}.png"
+            try:
+                if not self.save_image_retry(image, destination, "stage smart export frame"):
+                    return False
+            finally:
+                image.close()
+        return True
+
+    def run_ffmpeg_range_encode(self, ffmpeg, start_frame, end_frame, output_path):
+        frames_dir = SMART_EXPORT_DIR / "range_frames"
+        if not self.stage_frame_range_for_export(start_frame, end_frame, frames_dir):
+            return False
+        subprocess.run(
+            [
+                ffmpeg,
+                "-y",
+                "-framerate",
+                str(self.fps),
+                "-i",
+                str(frames_dir / "frame_%06d.png"),
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                str(output_path),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+        return True
+
+    def try_export_video_smart(self, ffmpeg, save_path):
+        if not self.can_smart_export_video():
+            return False
+        ranges = self.smart_export_ranges()
+        if not ranges:
+            return False
+
+        if not self.clear_work_folder(SMART_EXPORT_DIR, "clear smart export"):
+            return False
+
+        segment_paths = []
+        cursor = 0
+        segment_number = 1
+        try:
+            for start, end in ranges:
+                if cursor < start:
+                    path = SMART_EXPORT_DIR / f"segment_{segment_number:04d}_copy.mp4"
+                    self.loading_message = f"Copying original segment {segment_number}..."
+                    self.force_redraw()
+                    self.run_ffmpeg_output_range_copy(ffmpeg, cursor, start, path)
+                    segment_paths.append(path)
+                    segment_number += 1
+
+                path = SMART_EXPORT_DIR / f"segment_{segment_number:04d}_edit.mp4"
+                self.loading_message = f"Encoding edited segment {segment_number}..."
+                self.force_redraw()
+                if not self.run_ffmpeg_range_encode(ffmpeg, start, end, path):
+                    return False
+                segment_paths.append(path)
+                segment_number += 1
+                cursor = end
+
+            if cursor < len(self.frame_paths):
+                path = SMART_EXPORT_DIR / f"segment_{segment_number:04d}_copy.mp4"
+                self.loading_message = f"Copying original segment {segment_number}..."
+                self.force_redraw()
+                self.run_ffmpeg_output_range_copy(ffmpeg, cursor, len(self.frame_paths), path)
+                segment_paths.append(path)
+
+            concat_video = SMART_EXPORT_DIR / "_smart_video_only.mp4"
+            concat_list = SMART_EXPORT_DIR / "segments.txt"
+            if not self.write_concat_list(segment_paths, concat_list):
+                return False
+            self.loading_message = "Joining smart export segments..."
+            self.force_redraw()
+            subprocess.run(
+                [
+                    ffmpeg,
+                    "-y",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    str(concat_list),
+                    "-c",
+                    "copy",
+                    str(concat_video),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=True,
+            )
+
+            subprocess.run(
+                [
+                    ffmpeg,
+                    "-y",
+                    "-i",
+                    str(concat_video),
+                    "-i",
+                    str(self.video_path),
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "1:a?",
+                    "-c:v",
+                    "copy",
+                    "-c:a",
+                    "aac",
+                    "-shortest",
+                    save_path,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=True,
+            )
+            self.set_status(f"Smart exported {len(ranges)} edited range(s)", 5000)
+            return True
+        except (OSError, subprocess.CalledProcessError):
+            return False
+        finally:
+            self.retry_file_operation("clear smart export", lambda: shutil.rmtree(SMART_EXPORT_DIR), SMART_EXPORT_DIR, show_error=False)
+
     def export_video(self):
         if not self.frames:
             return
         ffmpeg = self.get_ffmpeg_tool("ffmpeg")
         if not ffmpeg:
+            return
+        if not self.confirm_unmodified_video_export():
+            self.set_status("Export cancelled; no frame changes")
             return
         save_path = filedialog.asksaveasfilename(
             title="Save video",
@@ -1111,70 +2771,107 @@ class FrameEditorApp:
         if not save_path:
             return
 
-        temp_video = TEMP_DIR / "_video_only_export.mp4"
-        width, height, output_fps = self.get_retarget_settings()
-
+        self.show_wait_popup("Please Wait... Exporting video")
         try:
-            subprocess.run(
-                [
-                    ffmpeg,
-                    "-y",
-                    "-framerate",
-                    str(output_fps),
-                    "-i",
-                    str(TEMP_DIR / "frame_%06d.png"),
-                    "-vf",
-                    f"scale={width}:{height}",
-                    "-c:v",
-                    "libx264",
-                    "-pix_fmt",
-                    "yuv420p",
-                    str(temp_video),
-                ],
-                check=True,
-            )
-        except (OSError, subprocess.CalledProcessError) as exc:
-            self.show_file_error("export video", temp_video, exc)
-            return
+            if self.video_path is not None and not self.has_video_frame_changes():
+                if self.copy_path_retry(self.video_path, save_path, "copy original video"):
+                    self.set_status("Copied original video; no frame changes")
+                return
 
-        if self.video_path is not None:
+            if self.try_export_video_smart(ffmpeg, save_path):
+                self.loading_message = ""
+                return
+
+            if not self.check_export_staging_size(len(self.frame_paths), "full video export"):
+                return
+            if not self.confirm_large_full_export():
+                self.set_status("Export cancelled")
+                return
+
+            self.set_status("Smart export unavailable; rendering full video", 5000)
+
+            temp_video = TEMP_DIR / "_video_only_export.mp4"
+            width, height, output_fps = self.get_retarget_settings()
+            if not self.stage_all_frames_for_export(EXPORT_TEMP_DIR, "RGBA"):
+                self.loading_message = ""
+                return
+
+            self.update_wait_popup("Please Wait... Encoding video")
             try:
                 subprocess.run(
                     [
                         ffmpeg,
                         "-y",
+                        "-framerate",
+                        str(output_fps),
                         "-i",
-                        str(temp_video),
-                        "-i",
-                        str(self.video_path),
-                        "-map",
-                        "0:v:0",
-                        "-map",
-                        "1:a?",
+                        str(EXPORT_TEMP_DIR / "frame_%06d.png"),
+                        "-vf",
+                        f"scale={width}:{height}",
                         "-c:v",
-                        "copy",
-                        "-c:a",
-                        "aac",
-                        "-shortest",
-                        save_path,
+                        "libx264",
+                        "-pix_fmt",
+                        "yuv420p",
+                        str(temp_video),
                     ],
                     check=True,
                 )
-                self.set_status("Exported video with original audio")
-            except subprocess.CalledProcessError:
-                if not self.copy_path_retry(temp_video, save_path, "save exported video"):
-                    return
-                self.set_status("Exported video only; audio copy failed")
-        else:
-            if not self.copy_path_retry(temp_video, save_path, "save exported video"):
+            except (OSError, subprocess.CalledProcessError) as exc:
+                self.retry_file_operation("clear export frames", lambda: shutil.rmtree(EXPORT_TEMP_DIR), EXPORT_TEMP_DIR, show_error=False)
+                self.loading_message = ""
+                self.show_file_error("export video", temp_video, exc)
                 return
-            self.set_status("Exported video only")
+
+            if self.video_path is not None:
+                self.update_wait_popup("Please Wait... Adding audio")
+                try:
+                    subprocess.run(
+                        [
+                            ffmpeg,
+                            "-y",
+                            "-i",
+                            str(temp_video),
+                            "-i",
+                            str(self.video_path),
+                            "-map",
+                            "0:v:0",
+                            "-map",
+                            "1:a?",
+                            "-c:v",
+                            "copy",
+                            "-c:a",
+                            "aac",
+                            "-shortest",
+                            save_path,
+                        ],
+                        check=True,
+                    )
+                    self.set_status("Exported video with original audio")
+                except subprocess.CalledProcessError:
+                    if not self.copy_path_retry(temp_video, save_path, "save exported video"):
+                        self.retry_file_operation("clear export frames", lambda: shutil.rmtree(EXPORT_TEMP_DIR), EXPORT_TEMP_DIR, show_error=False)
+                        self.loading_message = ""
+                        return
+                    self.set_status("Exported video only; audio copy failed")
+            else:
+                if not self.copy_path_retry(temp_video, save_path, "save exported video"):
+                    self.retry_file_operation("clear export frames", lambda: shutil.rmtree(EXPORT_TEMP_DIR), EXPORT_TEMP_DIR, show_error=False)
+                    self.loading_message = ""
+                    return
+                self.set_status("Exported video only")
+            self.retry_file_operation("clear export frames", lambda: shutil.rmtree(EXPORT_TEMP_DIR), EXPORT_TEMP_DIR, show_error=False)
+            self.loading_message = ""
+        finally:
+            self.hide_wait_popup()
 
     def export_high_quality_gif(self):
         if not self.frames:
             return
         ffmpeg = self.get_ffmpeg_tool("ffmpeg")
         if not ffmpeg:
+            return
+        if not self.confirm_large_gif_export():
+            self.set_status("GIF export cancelled")
             return
         save_path = filedialog.asksaveasfilename(
             title="Save high quality GIF",
@@ -1184,34 +2881,46 @@ class FrameEditorApp:
         if not save_path:
             return
 
-        width, height, output_fps = self.get_retarget_settings()
-        filter_graph = (
-            f"fps={output_fps},scale={width}:{height}:flags=lanczos,"
-            "split[s0][s1];"
-            "[s0]palettegen=max_colors=256:reserve_transparent=1[p];"
-            "[s1][p]paletteuse=dither=sierra2_4a:alpha_threshold=128"
-        )
+        self.show_wait_popup("Please Wait... Exporting GIF")
         try:
-            subprocess.run(
-                [
-                    ffmpeg,
-                    "-y",
-                    "-framerate",
-                    str(output_fps),
-                    "-i",
-                    str(TEMP_DIR / "frame_%06d.png"),
-                    "-filter_complex",
-                    filter_graph,
-                    "-loop",
-                    "0",
-                    save_path,
-                ],
-                check=True,
+            width, height, output_fps = self.get_retarget_settings()
+            if not self.stage_all_frames_for_export(EXPORT_TEMP_DIR, "RGBA"):
+                self.loading_message = ""
+                return
+            filter_graph = (
+                f"fps={output_fps},scale={width}:{height}:flags=lanczos,"
+                "split[s0][s1];"
+                "[s0]palettegen=max_colors=256:reserve_transparent=1[p];"
+                "[s1][p]paletteuse=dither=sierra2_4a:alpha_threshold=128"
             )
-        except (OSError, subprocess.CalledProcessError) as exc:
-            self.show_file_error("export GIF", save_path, exc)
-            return
-        self.set_status("Exported high quality GIF")
+            self.update_wait_popup("Please Wait... Encoding GIF")
+            try:
+                subprocess.run(
+                    [
+                        ffmpeg,
+                        "-y",
+                        "-framerate",
+                        str(output_fps),
+                        "-i",
+                        str(EXPORT_TEMP_DIR / "frame_%06d.png"),
+                        "-filter_complex",
+                        filter_graph,
+                        "-loop",
+                        "0",
+                        save_path,
+                    ],
+                    check=True,
+                )
+            except (OSError, subprocess.CalledProcessError) as exc:
+                self.retry_file_operation("clear export frames", lambda: shutil.rmtree(EXPORT_TEMP_DIR), EXPORT_TEMP_DIR, show_error=False)
+                self.loading_message = ""
+                self.show_file_error("export GIF", save_path, exc)
+                return
+            self.retry_file_operation("clear export frames", lambda: shutil.rmtree(EXPORT_TEMP_DIR), EXPORT_TEMP_DIR, show_error=False)
+            self.loading_message = ""
+            self.set_status("Exported high quality GIF")
+        finally:
+            self.hide_wait_popup()
 
     def clear_rife_work_dirs(self):
         for folder in (RIFE_INPUT_DIR, RIFE_OUTPUT_DIR):
@@ -1231,8 +2940,11 @@ class FrameEditorApp:
             image = self.open_image_copy(path, "RGB", "open RIFE input frame")
             if image is None:
                 return False
-            if not self.save_image_retry(image, staged, "stage RIFE input frame"):
-                return False
+            try:
+                if not self.save_image_retry(image, staged, "stage RIFE input frame"):
+                    return False
+            finally:
+                image.close()
         return True
 
     def stage_rife_paths(self, paths):
@@ -1243,8 +2955,11 @@ class FrameEditorApp:
             image = self.open_image_copy(path, "RGB", "open RIFE blend frame")
             if image is None:
                 return False
-            if not self.save_image_retry(image, staged, "stage RIFE blend frame"):
-                return False
+            try:
+                if not self.save_image_retry(image, staged, "stage RIFE blend frame"):
+                    return False
+            finally:
+                image.close()
         return True
 
     def get_rife_command(self, rife, multiplier, model_name, spatial_tta=False, temporal_tta=False, uhd_mode=False, target_count=None):
@@ -1271,11 +2986,13 @@ class FrameEditorApp:
 
     def run_rife_command(self, command, rife, label):
         self.loading_message = label
+        self.show_wait_popup(f"Please Wait... {label}")
         self.force_redraw()
         try:
             subprocess.run(command, cwd=str(Path(rife).resolve().parent), check=True)
         except (OSError, subprocess.CalledProcessError) as exc:
             self.loading_message = ""
+            self.hide_wait_popup()
             self.show_file_error("run RIFE interpolation", rife, exc)
             return None
         return sorted(RIFE_OUTPUT_DIR.rglob("*.png"))
@@ -1286,6 +3003,7 @@ class FrameEditorApp:
             self.set_status("RIFE did not create enough frames", 5000)
             return False
 
+        self.wait_for_pending_frame_saves()
         self.release_file_caches()
         for path in sorted(TEMP_DIR.glob("frame_*.png")):
             if not self.unlink_path_retry(path, show_error=True):
@@ -1296,9 +3014,15 @@ class FrameEditorApp:
             if not self.copy_path_retry(path, destination, "copy RIFE output frame"):
                 return False
 
-        self.frame_paths = sorted(TEMP_DIR.glob("frame_*.png"))
-        self.frames = [p.name for p in self.frame_paths]
+        output_count = len(output_paths)
+        self.frame_source_type = "images"
+        self.source_frame_paths = [None] * output_count
+        self.source_frame_indexes = []
+        self.set_virtual_frame_list(output_count)
+        self.edited_frame_indexes = set(range(output_count))
+        self.frame_buffer_order = []
         self.current_index = min(self.current_index * multiplier, max(0, len(self.frames) - 1))
+        self.set_loader_targets(self.current_index)
         self.fps *= multiplier
         if self.retarget_fps is not None:
             self.retarget_fps *= multiplier
@@ -1306,7 +3030,7 @@ class FrameEditorApp:
         self.set_status(f"RIFE interpolated to {len(self.frames)} frames @ {self.fps:.3f} FPS", 5000)
         return True
 
-    def run_rife_interpolation(self, multiplier, model_name, spatial_tta, temporal_tta, uhd_mode):
+    def run_rife_interpolation(self, multiplier, model_name, spatial_tta, temporal_tta, uhd_mode, max_frames=RIFE_FRAME_LIMIT):
         rife = self.find_rife_tool()
         if not rife:
             self.show_rife_missing_help()
@@ -1315,9 +3039,15 @@ class FrameEditorApp:
         if len(self.frames) < 2:
             self.set_status("RIFE needs at least two frames")
             return
+        if not self.can_run_large_operation(max_frames, "RIFE whole video"):
+            return
+        if not self.can_write_frame_edits(range(len(self.frames) * int(multiplier))):
+            return
 
         if multiplier != 2 and model_name != "rife-v4":
             self.set_status("RIFE 3x/4x requires the rife-v4 model", 5000)
+            return
+        if not self.check_rife_staging_size(multiplier):
             return
 
         if not self.stage_rife_input_frames():
@@ -1330,9 +3060,11 @@ class FrameEditorApp:
             return
 
         self.loading_message = "Loading RIFE frames..."
+        self.update_wait_popup("Please Wait... Loading RIFE frames")
         self.force_redraw()
         self.apply_rife_output_frames(multiplier)
         self.loading_message = ""
+        self.hide_wait_popup()
 
     def color_lerp_rife_frames(self, paths, left_reference_path, right_reference_path):
         try:
@@ -1389,9 +3121,15 @@ class FrameEditorApp:
             if not self.save_image_retry(image, destination, "save blended RIFE frame"):
                 return False
 
-        self.frame_paths = sorted(TEMP_DIR.glob("frame_*.png"))
-        self.frames = [p.name for p in self.frame_paths]
+        output_count = len(prepared)
+        self.frame_source_type = "images"
+        self.source_frame_paths = [None] * output_count
+        self.source_frame_indexes = []
+        self.set_virtual_frame_list(output_count)
+        self.edited_frame_indexes = set(range(output_count))
+        self.frame_buffer_order = []
         self.current_index = max(0, min(current_index, len(self.frames) - 1))
+        self.set_loader_targets(self.current_index)
         self.reset_after_frame_list_change()
         self.set_status(status_message, 5000)
         return True
@@ -1419,13 +3157,16 @@ class FrameEditorApp:
         middle_paths = self.get_middle_rife_frames(output_paths, 6)
         if len(middle_paths) < 6:
             self.loading_message = ""
+            self.hide_wait_popup()
             self.set_status("RIFE blend did not create enough middle frames", 5000)
             return None
 
         self.loading_message = "Color matching RIFE blend..."
+        self.update_wait_popup("Please Wait... Color matching RIFE blend")
         self.force_redraw()
         blended = self.color_lerp_rife_frames(middle_paths, left_reference_path, right_reference_path)
         self.loading_message = ""
+        self.hide_wait_popup()
         return blended
 
     def rife_blend_selected_split(self):
@@ -1550,51 +3291,122 @@ class FrameEditorApp:
         popup.bind("<Escape>", lambda _event: close_popup())
 
     # ---------- cache ----------
+    def load_surface_uncached(self, index, allow_async=False):
+        if allow_async:
+            surf = self.full_cache.get(index)
+            if surf is not None:
+                return surf, True
+            return self.make_black_frame_surface(), False
+
+        cached = self.get_cached_pil_frame(index, "RGBA")
+        if cached is not None:
+            return self.pygame_surface_from_pil(cached), True
+
+        path = self.frame_paths[index]
+        read_path, transient = self.resolve_frame_read_path(path, allow_async=allow_async)
+        if read_path is None:
+            return self.make_black_frame_surface(), False
+        surf = self.retry_file_operation(
+            "load frame image",
+            lambda: pygame.image.load(str(read_path)).convert_alpha(),
+            read_path,
+        )
+        self.cleanup_transient_frame(path, transient)
+        if surf is None:
+            return self.make_black_frame_surface(), False
+        if read_path is not None:
+            self.cache_pil_frame_from_path(index, read_path, queue_pygame=False)
+        return surf, True
+
     def load_full_surface(self, index):
         surf = self.full_cache.get(index)
         if surf is not None:
             return surf
-        surf = self.retry_file_operation(
-            "load frame image",
-            lambda: pygame.image.load(str(self.frame_paths[index])).convert_alpha(),
-            self.frame_paths[index],
-        )
-        if surf is None:
-            return pygame.Surface((1, 1), pygame.SRCALPHA).convert_alpha()
-        self.full_cache[index] = surf
+        surf, loaded = self.load_surface_uncached(index, allow_async=True)
+        if loaded:
+            self.full_cache[index] = surf
+            self.prune_full_cache()
         return surf
+
+    def prune_full_cache(self):
+        keep = set(self.centered_frame_indexes(MEMORY_PRELOAD_BEFORE, MEMORY_PRELOAD_AFTER))
+        for key in list(self.full_cache.keys()):
+            if key not in keep:
+                del self.full_cache[key]
+        with self.cache_lock:
+            for key in list(self.pil_cache.keys()):
+                if key not in keep and key not in self.edited_frame_indexes:
+                    del self.pil_cache[key]
+            self.pygame_cache_pending = [index for index in self.pygame_cache_pending if index in keep]
+            self.pygame_cache_pending_set = set(self.pygame_cache_pending)
+
+    def frame_ready_for_memory_cache(self, index):
+        if index < 0 or index >= len(self.frame_paths):
+            return False
+        path = self.frame_paths[index]
+        if path.exists():
+            return True
+        if self.frame_source_type == "images" and index < len(self.source_frame_paths):
+            return self.source_frame_paths[index] is not None
+        return False
+
+    def preload_memory_near_current(self, limit=MEMORY_PRELOAD_BATCH_SIZE, promote=True):
+        if not self.frames:
+            return
+        self.queue_memory_decode_near_current()
+        if promote:
+            self.process_pending_pygame_cache(limit=limit)
+        self.prune_full_cache()
 
     def build_thumb(self, index, selected=False):
         cache = self.large_thumb_cache if selected else self.thumb_cache
         if index in cache:
             return cache[index]
 
-        full = self.load_full_surface(index)
+        full, loaded = self.load_surface_uncached(index, allow_async=True)
         target_h = int(BASE_THUMB_H * (SELECTED_SCALE if selected else 1.0))
         scale = target_h / full.get_height()
         size = (max(1, int(full.get_width() * scale)), max(1, target_h))
         thumb = pygame.transform.smoothscale(full, size)
+        del full
         composed = pygame.Surface(size).convert()
         self.draw_alpha_background(composed, composed.get_rect())
         composed.blit(thumb, (0, 0))
-        cache[index] = composed
+        del thumb
+        if loaded:
+            cache[index] = composed
         return composed
 
-    def prime_caches_near_current(self):
+    def get_thumb_sizes_for_image_size(self, image_size):
+        width, height = image_size
+        if height <= 0:
+            height = 1
+        base_scale = BASE_THUMB_H / height
+        base_size = (max(1, int(width * base_scale)), BASE_THUMB_H)
+        large_h = int(BASE_THUMB_H * SELECTED_SCALE)
+        large_scale = large_h / height
+        large_size = (max(1, int(width * large_scale)), large_h)
+        return base_size, large_size
+
+    def prime_caches_near_current(self, maintain_preload=False):
         if not self.frames:
             return
 
         start = max(0, self.current_index - CACHE_RADIUS)
         end = min(len(self.frames), self.current_index + CACHE_RADIUS + 1)
         keep = set(range(start, end))
+        if maintain_preload:
+            self.queue_preload_near_current()
+            self.preload_memory_near_current()
 
         for i in range(start, end):
-            self.load_full_surface(i)
             self.build_thumb(i, selected=False)
             if i == self.current_index:
+                self.load_full_surface(i)
                 self.build_thumb(i, selected=True)
 
-        for cache in (self.full_cache, self.thumb_cache, self.large_thumb_cache):
+        self.prune_full_cache()
+        for cache in (self.thumb_cache, self.large_thumb_cache):
             for key in list(cache.keys()):
                 if key not in keep:
                     del cache[key]
@@ -1617,16 +3429,19 @@ class FrameEditorApp:
         self.large_thumb_sizes = []
         self.prefix_positions = []
 
-        x = TIMELINE_SIDE_PAD
-        for i in range(len(self.frames)):
-            base = self.build_thumb(i, selected=False)
-            large = self.build_thumb(i, selected=True)
-            self.base_thumb_sizes.append(base.get_size())
-            self.large_thumb_sizes.append(large.get_size())
-            self.prefix_positions.append(x)
-            x += base.get_width() + THUMB_SPACING
+        if not self.frames:
+            self.timeline_total_width = 0
+            return
 
-        self.timeline_total_width = max(0, x - THUMB_SPACING + TIMELINE_SIDE_PAD)
+        current_size = self.get_current_frame_size() or self.default_base_thumb_size
+        self.default_base_thumb_size, self.default_large_thumb_size = self.get_thumb_sizes_for_image_size(current_size)
+
+        frame_count = len(self.frames)
+        self.base_thumb_sizes = UniformSizeSequence(self, frame_count, "default_base_thumb_size")
+        self.large_thumb_sizes = UniformSizeSequence(self, frame_count, "default_large_thumb_size")
+        self.prefix_positions = UniformPrefixPositions(self, frame_count)
+        base_step = self.default_base_thumb_size[0] + THUMB_SPACING
+        self.timeline_total_width = max(0, TIMELINE_SIDE_PAD + frame_count * base_step - THUMB_SPACING + TIMELINE_SIDE_PAD)
 
     def get_thumb_rect(self, index):
         timeline = self.get_timeline_rect()
@@ -1713,19 +3528,143 @@ class FrameEditorApp:
         index = max(0, min(len(self.frames) - 1, index))
         if index == self.current_index:
             return
+        profile_start = time.perf_counter()
+        profile_last = profile_start
+        profile_sections = []
+
+        def profile_mark(label):
+            nonlocal profile_last
+            now = time.perf_counter()
+            profile_sections.append((label, (now - profile_last) * 1000.0))
+            profile_last = now
+
+        old_index = self.current_index
+        if abs(index - old_index) > DISK_PRELOAD_AFTER:
+            self.clear_preload_queue()
         self.current_index = index
+        self.set_loader_targets(index)
         self.wand_selection = None
         self.wand_dragging = False
         self.close_selection_tools()
+        profile_mark("select")
         self.preview_surface = None
         self.preview_surface_key = None
         self.needs_preview_refresh = True
-        self.clamp_preview_offset()
-        self.prime_caches_near_current()
+        fast_navigation = self.left_held or self.right_held
+        if not fast_navigation:
+            self.clamp_preview_offset()
+        profile_mark("clamp")
+        self.promote_pil_frame_to_pygame(index)
+        if not fast_navigation:
+            self.prime_caches_near_current()
+        profile_mark("prime")
         self.center_selected()
-        self.schedule_wand_zone_preload()
-        if self.color_popup is not None and self.color_popup.winfo_exists() and self.color_tool_refresh is not None:
+        profile_mark("center")
+        if not fast_navigation:
+            self.schedule_wand_zone_preload()
+        profile_mark("wand")
+        if not fast_navigation and self.color_popup is not None and self.color_popup.winfo_exists() and self.color_tool_refresh is not None:
             self.color_tool_refresh()
+        profile_mark("color")
+        self.report_frame_switch_profile(old_index, index, profile_start, profile_sections)
+
+    def report_frame_switch_profile(self, old_index, new_index, started_at, sections):
+        if not ENABLE_FRAME_SWITCH_PROFILING:
+            return
+        total_ms = (time.perf_counter() - started_at) * 1000.0
+        if total_ms < FRAME_SWITCH_PROFILE_MIN_MS:
+            return
+        details = ", ".join(f"{label} {elapsed:.1f}" for label, elapsed in sections if elapsed >= 0.1)
+        message = f"Frame {old_index}->{new_index}: {total_ms:.1f} ms"
+        if details:
+            message = f"{message} ({details})"
+        self.last_frame_switch_profile = message
+        print(message)
+
+        now = pygame.time.get_ticks()
+        target_ms = self.get_frame_repeat_interval_ms()
+        if total_ms >= target_ms and now >= self.next_frame_profile_status:
+            self.set_status(message, 2500)
+            self.next_frame_profile_status = now + 750
+
+    def parse_jump_target(self, value):
+        text = value.strip().lower()
+        if not text:
+            raise ValueError("Enter a frame number or time.")
+
+        if text.endswith("f"):
+            text = text[:-1].strip()
+            return int(round(float(text)))
+
+        if ":" in text:
+            parts = text.split(":")
+            if len(parts) not in (2, 3):
+                raise ValueError("Use mm:ss or hh:mm:ss for time.")
+            numbers = [float(part) for part in parts]
+            seconds = 0.0
+            for number in numbers:
+                seconds = seconds * 60.0 + number
+            return int(round(seconds * self.fps))
+
+        if text.endswith("s"):
+            seconds = float(text[:-1].strip())
+            return int(round(seconds * self.fps))
+
+        return int(round(float(text)))
+
+    def open_jump_to_frame(self):
+        if not self.frames:
+            self.set_status("Open a video or image sequence before jumping")
+            return
+
+        if self.jump_popup is not None and self.jump_popup.winfo_exists():
+            self.jump_popup.lift()
+            return
+
+        popup = Toplevel(self.tk_root)
+        popup.title("Jump To Frame")
+        popup.resizable(False, False)
+        self.jump_popup = popup
+
+        main = Frame(popup, padx=14, pady=12)
+        main.pack()
+        Label(main, text=f"Frame 0-{len(self.frames) - 1}, or time like 12.5s / 01:23").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        value_var = StringVar(value=str(self.current_index))
+        error_var = StringVar(value="")
+        entry = Entry(main, textvariable=value_var, width=24)
+        entry.grid(row=1, column=0, columnspan=2, sticky="ew")
+        Label(main, textvariable=error_var, fg="red").grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        buttons = Frame(main)
+        buttons.grid(row=3, column=0, columnspan=2, sticky="e", pady=(12, 0))
+
+        def close_popup():
+            if self.jump_popup is popup:
+                self.jump_popup = None
+            popup.destroy()
+
+        def apply_jump():
+            try:
+                index = self.parse_jump_target(value_var.get())
+            except (TypeError, ValueError):
+                error_var.set("Enter a frame number, seconds, or mm:ss time.")
+                return
+            if not self.frames:
+                close_popup()
+                return
+            index = max(0, min(len(self.frames) - 1, index))
+            close_popup()
+            self.set_current_index(index)
+            self.set_status(f"Jumped to frame {index}")
+
+        Button(buttons, text="Cancel", command=close_popup).pack(side="right", padx=(8, 0))
+        Button(buttons, text="Jump", command=apply_jump).pack(side="right")
+        popup.protocol("WM_DELETE_WINDOW", close_popup)
+        popup.bind("<Return>", lambda _event: apply_jump())
+        popup.bind("<Escape>", lambda _event: close_popup())
+        entry.focus_set()
+        entry.selection_range(0, "end")
 
     def refresh_preview_surface(self):
         if not self.frames:
@@ -1782,8 +3721,48 @@ class FrameEditorApp:
         except Exception:
             pass
 
+    def can_run_large_operation(self, max_frames=LARGE_OPERATION_FRAME_LIMIT, label="operation"):
+        if len(self.frames) <= max_frames:
+            return True
+        message = (
+            f"{label} is limited to {max_frames} frames by default.\n\n"
+            f"This project has {len(self.frames)} frames. Save/export your work and reopen a smaller section, "
+            "or call the tool with a higher max value if you intentionally want to override it."
+        )
+        self.set_status(f"{label} disabled over {max_frames} frames", 6000)
+        try:
+            messagebox.showwarning("Operation Too Large", message, parent=self.tk_root)
+        except Exception:
+            pass
+        return False
+
+    def can_write_frame_edits(self, indexes, max_edits=EDITED_FRAME_LIMIT):
+        new_indexes = {index for index in indexes if 0 <= index < len(self.frame_paths) and index not in self.edited_frame_indexes}
+        if len(self.edited_frame_indexes) + len(new_indexes) <= max_edits:
+            return True
+        message = (
+            f"Editing is limited to {max_edits} changed frames at a time.\n\n"
+            f"You already have {len(self.edited_frame_indexes)} edited frames and this would add {len(new_indexes)} more. "
+            "Save/export, reopen, then continue editing."
+        )
+        self.set_status(f"Edit limit reached ({max_edits} frames)", 6000)
+        try:
+            messagebox.showwarning("Edit Limit Reached", message, parent=self.tk_root)
+        except Exception:
+            pass
+        return False
+
+    def can_write_frame_edit(self, index, max_edits=EDITED_FRAME_LIMIT):
+        return self.can_write_frame_edits([index], max_edits)
+
     def release_file_caches(self):
         self.full_cache.clear()
+        with self.cache_lock:
+            self.pil_cache.clear()
+            self.pygame_cache_pending.clear()
+            self.pygame_cache_pending_set.clear()
+            self.memory_decode_queue.clear()
+            self.memory_decode_queued.clear()
         self.thumb_cache.clear()
         self.large_thumb_cache.clear()
         self.preview_surface = None
@@ -1806,15 +3785,33 @@ class FrameEditorApp:
         return None
 
     def open_image_copy(self, path, mode="RGBA", action="open image"):
-        def operation():
-            with Image.open(path) as image:
-                return image.convert(mode).copy() if mode else image.copy()
+        index = self.frame_index_from_temp_path(path)
+        if index is not None:
+            cached = self.get_cached_pil_frame(index, mode)
+            if cached is not None:
+                return cached
 
-        return self.retry_file_operation(action, operation, path)
+        read_path, transient = self.resolve_frame_read_path(path)
+
+        def operation():
+            with Image.open(read_path) as image:
+                result = image.convert(mode).copy() if mode else image.copy()
+                if index is not None:
+                    self.cache_pil_frame(index, result, queue_pygame=True)
+                return result
+
+        try:
+            return self.retry_file_operation(action, operation, read_path)
+        finally:
+            self.cleanup_transient_frame(path, transient)
 
     def save_image_retry(self, image, path, action="save image"):
+        path = Path(path)
+
         def operation():
+            path.parent.mkdir(parents=True, exist_ok=True)
             image.save(path)
+            self.mark_edited_frame_path(path)
             return True
 
         return bool(self.retry_file_operation(action, operation, path))
@@ -1832,6 +3829,23 @@ class FrameEditorApp:
             return True
 
         return bool(self.retry_file_operation("delete frame file", operation, path, show_error=show_error))
+
+    def unlink_path_quiet(self, path):
+        try:
+            Path(path).unlink(missing_ok=True)
+            return True
+        except OSError:
+            return False
+
+    def rename_path_quiet(self, src, dst):
+        try:
+            src = Path(src)
+            dst = Path(dst)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            src.replace(dst)
+            return True
+        except OSError:
+            return False
 
     def copy_path_retry(self, src, dst, action="copy file"):
         def operation():
@@ -1859,6 +3873,12 @@ class FrameEditorApp:
         else:
             for cache in (self.full_cache, self.thumb_cache, self.large_thumb_cache):
                 cache.pop(index, None)
+            with self.cache_lock:
+                self.pil_cache.pop(index, None)
+                self.pygame_cache_pending = [item for item in self.pygame_cache_pending if item != index]
+                self.pygame_cache_pending_set.discard(index)
+                self.memory_decode_queue = [item for item in self.memory_decode_queue if item != index]
+                self.memory_decode_queued.discard(index)
             with self.wand_zone_lock:
                 self.wand_zone_cache.pop(index, None)
 
@@ -1867,10 +3887,21 @@ class FrameEditorApp:
         self.needs_preview_refresh = True
 
     def save_edited_frame(self, index, image):
-        if not self.save_image_retry(image.convert("RGBA"), self.frame_paths[index], "save frame"):
+        if not self.can_write_frame_edit(index):
             return False
-        self.invalidate_frame_cache(index)
+        image = image.convert("RGBA")
+        self.mark_edited_frame_path(self.frame_paths[index])
+        self.cache_pil_frame(index, image, queue_pygame=True)
+        for cache in (self.full_cache, self.thumb_cache, self.large_thumb_cache):
+            cache.pop(index, None)
+        with self.wand_zone_lock:
+            self.wand_zone_cache.pop(index, None)
+        self.enqueue_frame_save(index, image)
+        self.preview_surface = None
+        self.preview_surface_key = None
+        self.needs_preview_refresh = True
         if index == self.current_index:
+            self.process_pending_pygame_cache(limit=1)
             self.schedule_wand_zone_preload()
         return True
 
@@ -2172,8 +4203,13 @@ class FrameEditorApp:
         self.rebuild_timeline_metrics()
         self.set_status(f"Blended selected frame {prev_weight:.0f}/{current_weight:.0f}/{next_weight:.0f}")
 
-    def match_video_to_selected_reference(self):
+    def match_video_to_selected_reference(self, max_frames=LARGE_OPERATION_FRAME_LIMIT):
         if not self.frames:
+            return
+        if not self.can_run_large_operation(max_frames, "Color match whole video"):
+            return
+        target_indexes = [i for i in range(len(self.frame_paths)) if i != self.current_index]
+        if not self.can_write_frame_edits(target_indexes):
             return
 
         reference_index = self.current_index
@@ -2191,7 +4227,7 @@ class FrameEditorApp:
                     self.loading_message = ""
                     return
                 matched = self.apply_color_match_method(image, reference)
-                if not self.save_image_retry(matched.convert("RGBA"), path, "save color matched frame"):
+                if not self.save_edited_frame(i, matched):
                     self.loading_message = ""
                     return
         except RuntimeError as exc:
@@ -2208,8 +4244,8 @@ class FrameEditorApp:
     def match_frame_to_color_reference(self, index=None):
         self.match_frame_to_selected_reference(index)
 
-    def match_video_to_color_reference(self):
-        self.match_video_to_selected_reference()
+    def match_video_to_color_reference(self, max_frames=LARGE_OPERATION_FRAME_LIMIT):
+        self.match_video_to_selected_reference(max_frames)
 
     def hue_between_smaller_arc(self, hue_degrees, start_degrees, end_degrees):
         hue = hue_degrees % 360.0
@@ -2392,6 +4428,10 @@ class FrameEditorApp:
                 self.set_status("Erased color range on selected frame")
 
         def erase_all():
+            if not self.can_run_large_operation(LARGE_OPERATION_FRAME_LIMIT, "Erase color range on all frames"):
+                return
+            if not self.can_write_frame_edits(range(len(self.frame_paths))):
+                return
             try:
                 hue_a, hue_b, low, high = values()
             except ValueError:
@@ -2431,7 +4471,8 @@ class FrameEditorApp:
         Button(buttons, text="Add Selection", command=lambda: update_selection("add")).pack(side="left", padx=(0, 8))
         Button(buttons, text="Subtract Selection", command=lambda: update_selection("subtract")).pack(side="left", padx=(0, 8))
         Button(buttons, text="Erase Current", command=erase_current).pack(side="left", padx=(0, 8))
-        Button(buttons, text="Erase All", command=erase_all).pack(side="left", padx=(0, 8))
+        erase_all_state = "normal" if len(self.frames) <= LARGE_OPERATION_FRAME_LIMIT else "disabled"
+        Button(buttons, text="Erase All", command=erase_all, state=erase_all_state).pack(side="left", padx=(0, 8))
         Button(buttons, text="Close", command=close_popup).pack(side="left")
 
         popup.protocol("WM_DELETE_WINDOW", close_popup)
@@ -2621,7 +4662,8 @@ class FrameEditorApp:
         buttons.grid(row=7, column=0, columnspan=4, sticky="e", pady=(12, 0))
         Button(buttons, text="Apply To Selected", command=apply_to_current).pack(side="left", padx=(0, 8))
         Button(buttons, text="Blend Adjacent", command=blend_adjacent).pack(side="left", padx=(0, 8))
-        Button(buttons, text="Match Whole Video", command=match_all).pack(side="left", padx=(0, 8))
+        match_all_state = "normal" if len(self.frames) <= LARGE_OPERATION_FRAME_LIMIT else "disabled"
+        Button(buttons, text="Match Whole Video", command=match_all, state=match_all_state).pack(side="left", padx=(0, 8))
         Button(buttons, text="Close", command=close_popup).pack(side="left")
 
         popup.protocol("WM_DELETE_WINDOW", close_popup)
@@ -3031,7 +5073,7 @@ class FrameEditorApp:
         return indexes
 
     def schedule_wand_zone_preload(self):
-        if not self.frames:
+        if not self.frames or not self.wand_mode:
             return
         with self.wand_zone_lock:
             self.wand_preload_targets = self.get_wand_preload_indexes()
@@ -3355,23 +5397,32 @@ class FrameEditorApp:
             self.rebuild_timeline_metrics()
             self.set_status("Added magic outline")
 
-    def magic_outline_whole_video(self):
+    def magic_outline_whole_video(self, max_frames=LARGE_OPERATION_FRAME_LIMIT):
         if not self.frames:
             return
+        if not self.can_run_large_operation(max_frames, "Magic outline whole video"):
+            return
+        if not self.can_write_frame_edits(range(len(self.frame_paths))):
+            return
         self.loading_message = "Adding magic outline..."
+        self.show_wait_popup("Please Wait... Adding magic outline")
         self.force_redraw()
-        for i in range(len(self.frame_paths)):
-            self.loading_message = f"Adding magic outline... {i + 1}/{len(self.frame_paths)}"
-            if i % 5 == 0:
-                self.force_redraw()
-            if not self.apply_magic_outline_to_frame(i):
-                self.loading_message = ""
-                return
-        self.loading_message = ""
-        self.invalidate_frame_cache()
-        self.prime_caches_near_current()
-        self.rebuild_timeline_metrics()
-        self.set_status("Added magic outline to all frames", 5000)
+        try:
+            for i in range(len(self.frame_paths)):
+                self.loading_message = f"Adding magic outline... {i + 1}/{len(self.frame_paths)}"
+                if i % 5 == 0:
+                    self.update_wait_popup(self.loading_message)
+                    self.force_redraw()
+                if not self.apply_magic_outline_to_frame(i):
+                    self.loading_message = ""
+                    return
+            self.loading_message = ""
+            self.invalidate_frame_cache()
+            self.prime_caches_near_current()
+            self.rebuild_timeline_metrics()
+            self.set_status("Added magic outline to all frames", 5000)
+        finally:
+            self.hide_wait_popup()
 
     def clear_magic_outline_current_frame(self):
         if not self.frames:
@@ -3381,23 +5432,32 @@ class FrameEditorApp:
             self.rebuild_timeline_metrics()
             self.set_status("Cleared magic outline")
 
-    def clear_magic_outline_whole_video(self):
+    def clear_magic_outline_whole_video(self, max_frames=LARGE_OPERATION_FRAME_LIMIT):
         if not self.frames:
             return
+        if not self.can_run_large_operation(max_frames, "Clear magic outline whole video"):
+            return
+        if not self.can_write_frame_edits(range(len(self.frame_paths))):
+            return
         self.loading_message = "Clearing magic outline..."
+        self.show_wait_popup("Please Wait... Clearing magic outline")
         self.force_redraw()
-        for i in range(len(self.frame_paths)):
-            self.loading_message = f"Clearing magic outline... {i + 1}/{len(self.frame_paths)}"
-            if i % 5 == 0:
-                self.force_redraw()
-            if not self.clear_magic_outline_from_frame(i):
-                self.loading_message = ""
-                return
-        self.loading_message = ""
-        self.invalidate_frame_cache()
-        self.prime_caches_near_current()
-        self.rebuild_timeline_metrics()
-        self.set_status("Cleared magic outline from all frames", 5000)
+        try:
+            for i in range(len(self.frame_paths)):
+                self.loading_message = f"Clearing magic outline... {i + 1}/{len(self.frame_paths)}"
+                if i % 5 == 0:
+                    self.update_wait_popup(self.loading_message)
+                    self.force_redraw()
+                if not self.clear_magic_outline_from_frame(i):
+                    self.loading_message = ""
+                    return
+            self.loading_message = ""
+            self.invalidate_frame_cache()
+            self.prime_caches_near_current()
+            self.rebuild_timeline_metrics()
+            self.set_status("Cleared magic outline from all frames", 5000)
+        finally:
+            self.hide_wait_popup()
 
     def open_magic_outline_tools(self):
         if not self.frames:
@@ -3419,8 +5479,9 @@ class FrameEditorApp:
 
         Button(main, text="Add Current", command=self.magic_outline_current_frame, width=18).grid(row=1, column=0, padx=(0, 8), pady=4)
         Button(main, text="Clear Current", command=self.clear_magic_outline_current_frame, width=18).grid(row=1, column=1, pady=4)
-        Button(main, text="Add Whole Video", command=self.magic_outline_whole_video, width=18).grid(row=2, column=0, padx=(0, 8), pady=4)
-        Button(main, text="Clear Whole Video", command=self.clear_magic_outline_whole_video, width=18).grid(row=2, column=1, pady=4)
+        whole_state = "normal" if len(self.frames) <= LARGE_OPERATION_FRAME_LIMIT else "disabled"
+        Button(main, text="Add Whole Video", command=self.magic_outline_whole_video, width=18, state=whole_state).grid(row=2, column=0, padx=(0, 8), pady=4)
+        Button(main, text="Clear Whole Video", command=self.clear_magic_outline_whole_video, width=18, state=whole_state).grid(row=2, column=1, pady=4)
 
         def close_popup():
             self.close_magic_outline_tools()
@@ -3430,6 +5491,8 @@ class FrameEditorApp:
         popup.bind("<Escape>", lambda _event: close_popup())
 
     def remove_background_from_frame(self, index):
+        if not self.can_write_frame_edit(index):
+            raise RuntimeError(f"Edit limit reached ({EDITED_FRAME_LIMIT} frames)")
         try:
             rembg_module = importlib.import_module("rembg")
             remove = rembg_module.remove
@@ -3467,6 +5530,7 @@ class FrameEditorApp:
             return
         self.loading_message = "Removing background... please wait"
         self.set_status("Removing background; this can take a while", 5000)
+        self.show_wait_popup("Please Wait... Removing background")
         self.force_redraw()
         try:
             self.remove_background_from_frame(self.current_index)
@@ -3474,27 +5538,37 @@ class FrameEditorApp:
             self.loading_message = ""
             self.set_status(str(exc))
             return
+        finally:
+            self.hide_wait_popup()
         self.loading_message = ""
         self.invalidate_frame_cache(self.current_index)
         self.prime_caches_near_current()
         self.rebuild_timeline_metrics()
         self.set_status("Removed background; enable Mask Edit to restore areas", 4000)
 
-    def remove_background_whole_video(self):
+    def remove_background_whole_video(self, max_frames=LARGE_OPERATION_FRAME_LIMIT):
         if not self.frames:
+            return
+        if not self.can_run_large_operation(max_frames, "Remove backgrounds whole video"):
+            return
+        if not self.can_write_frame_edits(range(len(self.frame_paths))):
             return
         self.loading_message = "Removing backgrounds... please wait"
         self.set_status("Removing backgrounds; this can take a while", 5000)
+        self.show_wait_popup("Please Wait... Removing backgrounds")
         self.force_redraw()
         try:
             for i in range(len(self.frames)):
                 self.loading_message = f"Removing backgrounds... {i + 1}/{len(self.frames)}"
+                self.update_wait_popup(self.loading_message)
                 self.force_redraw()
                 self.remove_background_from_frame(i)
         except Exception as exc:
             self.loading_message = ""
             self.set_status(str(exc))
             return
+        finally:
+            self.hide_wait_popup()
         self.loading_message = ""
         self.invalidate_frame_cache()
         self.prime_caches_near_current()
@@ -3613,21 +5687,23 @@ class FrameEditorApp:
 
         dst = self.frame_paths[self.current_index]
         current_alpha = None
-        if dst.exists():
-            current = self.open_image_copy(dst, "RGBA", "open current frame")
-            if current is None:
-                return
-            current_alpha = current.getchannel("A")
+        current = self.open_image_copy(dst, "RGBA", "open current frame")
+        if current is None:
+            return
+        current_alpha = current.getchannel("A")
+        current.close()
 
         clipboard_image = get_image_from_clipboard()
         if clipboard_image is not None:
+            if not self.can_write_frame_edit(self.current_index):
+                return
             pasted = clipboard_image.convert("RGBA")
             has_pasted_alpha = "A" in clipboard_image.getbands()
             if current_alpha is not None and not has_pasted_alpha:
                 if pasted.size != current_alpha.size:
                     pasted = pasted.resize(current_alpha.size, Image.Resampling.LANCZOS)
                 pasted.putalpha(current_alpha)
-            if not self.save_image_retry(pasted, dst, "paste frame"):
+            if not self.save_edited_frame(self.current_index, pasted):
                 return
         else:
             src = None
@@ -3656,37 +5732,34 @@ class FrameEditorApp:
             pasted = self.open_image_copy(src, "RGBA", "open pasted image")
             if pasted is None:
                 return
+            if not self.can_write_frame_edit(self.current_index):
+                pasted.close()
+                return
             if current_alpha is not None and not has_pasted_alpha:
                 if pasted.size != current_alpha.size:
                     pasted = pasted.resize(current_alpha.size, Image.Resampling.LANCZOS)
                 pasted.putalpha(current_alpha)
-            if not self.save_image_retry(pasted, dst, "paste frame"):
+            if not self.save_edited_frame(self.current_index, pasted):
                 return
 
-        self.invalidate_frame_cache(self.current_index)
         self.prime_caches_near_current()
         self.rebuild_timeline_metrics()
 
     def renumber_frame_files(self):
+        self.wait_for_pending_frame_saves()
         self.release_file_caches()
-        existing = sorted(TEMP_DIR.glob("frame_*.png"))
-        temp_paths = []
-        for i, path in enumerate(existing):
-            temp_path = TEMP_DIR / f"_renumber_{i:06d}.png"
-            if not self.rename_path_retry(path, temp_path):
-                return False
-            temp_paths.append(temp_path)
-
-        for i, path in enumerate(temp_paths, start=1):
-            if not self.rename_path_retry(path, TEMP_DIR / f"frame_{i:06d}.png"):
-                return False
-
-        self.frame_paths = sorted(TEMP_DIR.glob("frame_*.png"))
-        self.frames = [p.name for p in self.frame_paths]
+        self.set_virtual_frame_list(len(self.frame_paths))
         return True
 
     def reset_after_frame_list_change(self):
+        self.clear_preload_queue()
         self.full_cache.clear()
+        with self.cache_lock:
+            self.pil_cache.clear()
+            self.pygame_cache_pending.clear()
+            self.pygame_cache_pending_set.clear()
+            self.memory_decode_queue.clear()
+            self.memory_decode_queued.clear()
         self.thumb_cache.clear()
         self.large_thumb_cache.clear()
         with self.wand_zone_lock:
@@ -3716,9 +5789,59 @@ class FrameEditorApp:
         image = self.open_image_copy(self.frame_paths[self.current_index], "RGBA", "open current frame")
         if image is None:
             return
-        if not self.save_image_retry(image, save_path, "export current frame"):
-            return
+        self.show_wait_popup("Please Wait... Saving frame")
+        try:
+            if not self.save_image_retry(image, save_path, "export current frame"):
+                return
+        finally:
+            image.close()
+            self.hide_wait_popup()
         self.set_status("Exported current frame")
+
+    def get_export_base_name(self):
+        name = self.media_name or "frames"
+        invalid_chars = '<>:"/\\|?*'
+        cleaned = "".join("_" if char in invalid_chars or ord(char) < 32 else char for char in name).strip(" .")
+        return cleaned or "frames"
+
+    def export_frames_to_folder(self):
+        if not self.frames:
+            return
+
+        folder = filedialog.askdirectory(title="Export frames to folder")
+        if not folder:
+            return
+
+        output_dir = Path(folder)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        base_name = self.get_export_base_name()
+        total = len(self.frame_paths)
+
+        self.loading_message = "Exporting frames..."
+        self.show_wait_popup("Please Wait... Exporting frames")
+        self.force_redraw()
+        try:
+            for i, path in enumerate(self.frame_paths, start=1):
+                self.loading_message = f"Exporting frames... {i}/{total}"
+                if i == 1 or i % 5 == 0:
+                    self.update_wait_popup(self.loading_message)
+                    self.force_redraw()
+                image = self.open_image_copy(path, "RGBA", "open frame for folder export")
+                if image is None:
+                    self.loading_message = ""
+                    return
+                destination = output_dir / f"{base_name}_{i}.png"
+                try:
+                    if not self.save_image_retry(image, destination, "export frame to folder"):
+                        self.loading_message = ""
+                        return
+                finally:
+                    image.close()
+        finally:
+            self.hide_wait_popup()
+
+        self.loading_message = ""
+        self.set_status(f"Exported {total} PNG frames to folder", 5000)
 
     def resize_image_for_append(self, image, target_size, mode):
         target_w, target_h = target_size
@@ -3774,7 +5897,7 @@ class FrameEditorApp:
             return
         path = filedialog.askopenfilename(
             title="Append image frame",
-            filetypes=[("Image Files", " ".join(f"*{ext}" for ext in sorted(SUPPORTED_IMAGE_TYPES)))],
+            filetypes=SUPPORTED_IMAGE_FILETYPES,
         )
         if not path:
             return
@@ -3794,23 +5917,44 @@ class FrameEditorApp:
             image = self.resize_image_for_append(image, target_size, mode)
 
         insert_index = self.current_index + 1
+        if not self.can_write_frame_edits([insert_index]):
+            return
         temp_insert = TEMP_DIR / "_insert_frame.png"
         if not self.save_image_retry(image, temp_insert, "save inserted frame"):
             return
 
+        frame_count = len(self.frame_paths)
+        self.wait_for_pending_frame_saves()
         self.release_file_caches()
-        for i in range(len(self.frame_paths), insert_index, -1):
-            src = TEMP_DIR / f"frame_{i:06d}.png"
-            dst = TEMP_DIR / f"frame_{i + 1:06d}.png"
+        for i in range(frame_count - 1, insert_index - 1, -1):
+            src = self.frame_temp_path(i)
+            dst = self.frame_temp_path(i + 1)
             if src.exists():
                 if not self.rename_path_retry(src, dst):
                     return
 
-        if not self.rename_path_retry(temp_insert, TEMP_DIR / f"frame_{insert_index + 1:06d}.png"):
+        if not self.rename_path_retry(temp_insert, self.frame_temp_path(insert_index)):
             return
-        if not self.renumber_frame_files():
-            return
+        if self.frame_source_type == "images":
+            self.source_frame_paths.insert(insert_index, None)
+        elif self.frame_source_type == "video":
+            self.source_frame_indexes.insert(insert_index, insert_index)
+        else:
+            self.frame_source_type = "images"
+            self.source_frame_paths = [None] * frame_count
+            self.source_frame_paths.insert(insert_index, None)
+        self.edited_frame_indexes = {
+            index if index < insert_index else index + 1
+            for index in self.edited_frame_indexes
+        }
+        self.frame_buffer_order = [
+            index if index < insert_index else index + 1
+            for index in self.frame_buffer_order
+        ]
+        self.edited_frame_indexes.add(insert_index)
+        self.set_virtual_frame_list(frame_count + 1)
         self.current_index = insert_index
+        self.set_loader_targets(self.current_index)
         self.reset_after_frame_list_change()
         self.set_status("Appended frame")
 
@@ -3855,6 +5999,10 @@ class FrameEditorApp:
             self.loading_message = ""
             self.set_status("No frames found in appended video")
             return
+        original_count = len(self.frame_paths)
+        if not self.can_write_frame_edits(range(original_count, original_count + len(append_paths))):
+            self.loading_message = ""
+            return
 
         first = self.open_image_copy(append_paths[0], "RGBA", "open appended video frame")
         if first is None:
@@ -3867,7 +6015,7 @@ class FrameEditorApp:
                 self.loading_message = ""
                 return
 
-        start_index = len(self.frame_paths) + 1
+        start_index = original_count + 1
         self.release_file_caches()
         for offset, src in enumerate(append_paths):
             self.loading_message = f"Appending frames... {offset + 1}/{len(append_paths)}"
@@ -3884,9 +6032,18 @@ class FrameEditorApp:
                 self.loading_message = ""
                 return
 
-        self.frame_paths = sorted(TEMP_DIR.glob("frame_*.png"))
-        self.frames = [p.name for p in self.frame_paths]
+        appended_count = len(append_paths)
+        if self.frame_source_type == "images":
+            self.source_frame_paths.extend([None] * appended_count)
+        elif self.frame_source_type == "video":
+            self.source_frame_indexes.extend(range(original_count, original_count + appended_count))
+        else:
+            self.frame_source_type = "images"
+            self.source_frame_paths = [None] * (original_count + appended_count)
+        self.set_virtual_frame_list(original_count + appended_count)
+        self.edited_frame_indexes.update(range(original_count, original_count + appended_count))
         self.current_index = start_index - 1
+        self.set_loader_targets(self.current_index)
         self.reset_after_frame_list_change()
         self.loading_message = ""
 
@@ -3901,13 +6058,35 @@ class FrameEditorApp:
 
         delete_index = self.current_index
         delete_path = self.frame_paths[delete_index]
+        self.wait_for_pending_frame_saves()
         self.release_file_caches()
-        if not self.unlink_path_retry(delete_path):
-            return
+        self.unlink_path_retry(delete_path, show_error=False)
 
-        if not self.renumber_frame_files():
-            return
+        frame_count = len(self.frame_paths)
+        for i in range(delete_index + 1, frame_count):
+            src = self.frame_temp_path(i)
+            dst = self.frame_temp_path(i - 1)
+            if src.exists() and not self.rename_path_retry(src, dst):
+                return
+
+        if self.frame_source_type == "images" and delete_index < len(self.source_frame_paths):
+            self.source_frame_paths.pop(delete_index)
+        if self.frame_source_type == "video" and delete_index < len(self.source_frame_indexes):
+            self.source_frame_indexes.pop(delete_index)
+
+        self.edited_frame_indexes = {
+            index if index < delete_index else index - 1
+            for index in self.edited_frame_indexes
+            if index != delete_index
+        }
+        self.frame_buffer_order = [
+            index if index < delete_index else index - 1
+            for index in self.frame_buffer_order
+            if index != delete_index
+        ]
+        self.set_virtual_frame_list(frame_count - 1)
         self.current_index = max(0, min(delete_index, len(self.frames) - 1))
+        self.set_loader_targets(self.current_index)
 
         if self.frames:
             self.reset_after_frame_list_change()
@@ -3933,11 +6112,13 @@ class FrameEditorApp:
     def get_file_menu_items(self):
         return [
             ("Open Video...", "O", self.open_video, True),
+            ("Open Image Folder...", "", self.open_image_folder, True),
             ("Append Video...", "", self.append_video_frames, bool(self.frames)),
             ("Reload Source", "Ctrl+R", self.reload_video, self.video_path is not None),
             ("Retarget Size/FPS...", "R", self.retarget_size_fps, bool(self.frames)),
             ("Preview Animation", "P", self.show_animation_preview, bool(self.frames)),
             ("Export Video...", "S", self.export_video, bool(self.frames)),
+            ("Export Frames To Folder...", "", self.export_frames_to_folder, bool(self.frames)),
             ("Export High Quality GIF...", "", self.export_high_quality_gif, bool(self.frames)),
             ("Exit", "", self.exit_app, True),
         ]
@@ -3949,11 +6130,13 @@ class FrameEditorApp:
             ("Copy Current Frame", "C", self.copy_frame, bool(self.frames)),
             ("Paste Over Current Frame", "V", self.paste_frame, bool(self.frames)),
             ("Append Frame After Current...", "", self.append_frame_after_current, bool(self.frames)),
-            ("RIFE Double FPS...", "", self.open_rife_interpolation, bool(self.frames)),
+            ("RIFE Double FPS...", "", self.open_rife_interpolation, bool(self.frames) and len(self.frames) <= RIFE_FRAME_LIMIT),
             ("RIFE Blend Selected Split", "", self.rife_blend_selected_split, can_split_blend),
             ("RIFE Blend Loop Seam", "", self.rife_blend_loop, can_loop_blend),
             ("Export Current Frame...", "", self.export_current_frame, bool(self.frames)),
             ("Delete Current Frame", "Del", self.delete_current_frame, bool(self.frames)),
+            ("Reload Frame From Source", "", self.reload_current_frame_from_source, self.can_reload_current_frame_from_source()),
+            ("Jump To Frame/Time...", "J", self.open_jump_to_frame, bool(self.frames)),
             ("First Frame", "Home", lambda: self.set_current_index(0), bool(self.frames)),
             ("Last Frame", "End", lambda: self.set_current_index(len(self.frames) - 1), bool(self.frames)),
             ("Reset Preview", "0", self.reset_preview_view, bool(self.frames)),
@@ -3963,7 +6146,7 @@ class FrameEditorApp:
         return [
             ("Color Tools...", "H", self.open_color_tools, bool(self.frames)),
             ("Blend Selected With Adjacent", "", self.blend_selected_with_adjacent_frames, bool(self.frames)),
-            ("Match Whole Video To Selected", "", self.match_video_to_selected_reference, bool(self.frames)),
+            ("Match Whole Video To Selected", "", self.match_video_to_selected_reference, bool(self.frames) and len(self.frames) <= LARGE_OPERATION_FRAME_LIMIT),
         ]
 
     def get_background_menu_items(self):
@@ -3980,7 +6163,7 @@ class FrameEditorApp:
             ("Magic Outline...", "", self.open_magic_outline_tools, bool(self.frames)),
             ("RMBG Settings...", "", self.open_rembg_settings, True),
             ("Remove BG Current", "", self.remove_background_current_frame, bool(self.frames)),
-            ("Remove BG Whole Video", "", self.remove_background_whole_video, bool(self.frames)),
+            ("Remove BG Whole Video", "", self.remove_background_whole_video, bool(self.frames) and len(self.frames) <= LARGE_OPERATION_FRAME_LIMIT),
         ]
 
     def get_menu_items(self, menu_name):
@@ -4036,12 +6219,14 @@ class FrameEditorApp:
 
     def handle_dropfile(self, file_path):
         path = Path(file_path)
-        if path.suffix.lower() in SUPPORTED_VIDEO_EXTS:
+        if path.is_dir():
+            self.open_image_folder_path(path)
+        elif path.suffix.lower() in SUPPORTED_VIDEO_EXTS:
             self.open_video_path(path)
         elif path.suffix.lower() in SUPPORTED_IMAGE_TYPES:
             self.open_image_path(path)
         else:
-            self.set_status("Drop a supported video, animation, or image file")
+            self.set_status("Drop a supported video, animation, image file, or image folder")
 
     # ---------- input ----------
     def handle_mouse_button_down(self, event):
@@ -4155,6 +6340,7 @@ class FrameEditorApp:
             self.last_drag_dx = dx
             self.last_mouse_x = event.pos[0]
             self.clamp_scroll()
+            self.update_target_from_timeline_view()
             if abs(event.pos[0] - self.click_down_pos[0]) > 6 or abs(event.pos[1] - self.click_down_pos[1]) > 6:
                 self.click_candidate = False
         elif self.dragging_preview:
@@ -4171,14 +6357,14 @@ class FrameEditorApp:
         ctrl_held = bool(event.mod & (pygame.KMOD_CTRL | pygame.KMOD_META))
         if event.key == pygame.K_LEFT:
             self.left_held = True
-            self.left_next_repeat = now + KEY_REPEAT_DELAY_MS
             if self.frames:
                 self.set_current_index(self.current_index - 1)
+            self.left_next_repeat = now + self.get_frame_repeat_interval_ms()
         elif event.key == pygame.K_RIGHT:
             self.right_held = True
-            self.right_next_repeat = now + KEY_REPEAT_DELAY_MS
             if self.frames:
                 self.set_current_index(self.current_index + 1)
+            self.right_next_repeat = now + self.get_frame_repeat_interval_ms()
         elif event.key == pygame.K_UP:
             if self.selection_is_visible():
                 self.grow_wand_selection(1)
@@ -4202,6 +6388,8 @@ class FrameEditorApp:
             self.show_animation_preview()
         elif event.key == pygame.K_h:
             self.open_color_tools()
+        elif event.key == pygame.K_j:
+            self.open_jump_to_frame()
         elif event.key == pygame.K_m:
             self.toggle_mask_edit_mode()
         elif event.key == pygame.K_w:
@@ -4234,8 +6422,24 @@ class FrameEditorApp:
     def handle_keyup(self, event):
         if event.key == pygame.K_LEFT:
             self.left_held = False
+            self.finish_fast_navigation()
         elif event.key == pygame.K_RIGHT:
             self.right_held = False
+            self.finish_fast_navigation()
+
+    def finish_fast_navigation(self):
+        if not self.frames or self.left_held or self.right_held:
+            return
+        self.clamp_preview_offset()
+        self.prime_caches_near_current()
+        self.schedule_wand_zone_preload()
+        if self.color_popup is not None and self.color_popup.winfo_exists() and self.color_tool_refresh is not None:
+            self.color_tool_refresh()
+
+    def get_frame_repeat_interval_ms(self):
+        target_fps = self.retarget_fps if self.retarget_fps is not None else self.fps
+        target_fps = max(1.0, float(target_fps or 1.0))
+        return max(1, int(round(1000.0 / target_fps)))
 
     # ---------- drawing ----------
     def get_top_bar_hints(self):
@@ -4451,12 +6655,20 @@ class FrameEditorApp:
         clip = self.screen.get_clip()
         self.screen.set_clip(rect)
 
-        for i in range(len(self.frames)):
+        base_step = max(1, self.default_base_thumb_size[0] + THUMB_SPACING)
+        start_index = max(0, int((self.scroll_x - TIMELINE_SIDE_PAD - 120) / base_step) - 2)
+        end_index = min(len(self.frames), int((self.scroll_x + rect.w + 120) / base_step) + 3)
+        visible_indexes = range(start_index, end_index)
+
+        for i in visible_indexes:
             thumb_rect = self.get_thumb_rect(i)
             if thumb_rect.right < rect.x - 50 or thumb_rect.x > rect.right + 50:
                 continue
 
             surf = self.build_thumb(i, selected=(i == self.current_index))
+            if surf.get_size() != thumb_rect.size:
+                thumb_rect.size = surf.get_size()
+                thumb_rect.centery = rect.y + rect.h // 2 + 4
             self.screen.blit(surf, thumb_rect.topleft)
             border = ACCENT if i == self.current_index else (55, 55, 55)
             border_w = 3 if i == self.current_index else 1
@@ -4477,18 +6689,26 @@ class FrameEditorApp:
 
         if self.left_held and now >= self.left_next_repeat and self.frames:
             self.set_current_index(self.current_index - 1)
-            self.left_next_repeat = now + KEY_REPEAT_INTERVAL_MS
+            self.left_next_repeat = now + self.get_frame_repeat_interval_ms()
 
         if self.right_held and now >= self.right_next_repeat and self.frames:
             self.set_current_index(self.current_index + 1)
-            self.right_next_repeat = now + KEY_REPEAT_INTERVAL_MS
+            self.right_next_repeat = now + self.get_frame_repeat_interval_ms()
 
         if not self.dragging_timeline and abs(self.scroll_velocity) > 0.01:
             self.scroll_x += self.scroll_velocity
             self.scroll_velocity *= SCROLL_FRICTION
             self.clamp_scroll()
+            self.update_target_from_timeline_view()
         else:
             self.scroll_velocity = 0.0
+
+        if self.frames:
+            self.promote_pil_frame_to_pygame(self.current_index)
+
+        scrubbing = self.left_held or self.right_held
+        if not scrubbing:
+            self.process_pending_pygame_cache(limit=max(3, self.get_background_chunk_size() // 8))
 
     def run(self):
         while True:
@@ -4534,6 +6754,24 @@ class FrameEditorApp:
             except (OSError, PermissionError) as exc:
                 self.handle_filesystem_exception(exc)
             self.clock.tick(60)
+            self.log_loop_stats()
+
+    def log_loop_stats(self):
+        self.loop_frame_count += 1
+        now = time.perf_counter()
+        if now < self.loop_next_log_time:
+            return
+        elapsed = max(0.001, now - self.loop_last_log_time)
+        app_fps = self.loop_frame_count / elapsed
+        self.loop_frame_count = 0
+        self.loop_last_log_time = now
+        self.loop_next_log_time = now + 1.0
+        print(
+            "app "
+            f"fps={app_fps:.1f} current={self.current_index} target={self.get_target_frame()} "
+            f"left={int(self.left_held)} right={int(self.right_held)} dragging_timeline={int(self.dragging_timeline)}",
+            flush=True,
+        )
 
 
 def main():

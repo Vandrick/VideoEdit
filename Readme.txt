@@ -69,6 +69,25 @@ File > Append Video decodes another video or animation and adds its frames after
 If the appended video has a different frame size, choose Scale To Fit, Center Crop, or Stretch.
 The current project FPS is kept; the status bar notes when the appended video's source FPS differs.
 
+Image folders
+File > Open Image Folder loads all supported images in a folder, sorted by name, as editable frames.
+File > Export Frames To Folder writes the edited frames as PNG files named SourceName_1.png, SourceName_2.png, and so on.
+Image folders and videos are loaded lazily: source frames stay in their original files, and temp_frames keeps only edited frames plus short-lived export/interpolation staging files.
+
+Navigation
+Frame > Jump To Frame/Time or J jumps to a frame number, seconds value like 12.5s, or time value like 01:23.
+Lazy video loading keeps up to 500 source frames buffered on disk around the selected frame so revisiting nearby frames does not always re-extract from the original video.
+The viewer preloads nearby video frames in background chunks sized around the target FPS to 2x the target FPS, with minimum batch sizes to avoid one-frame ffmpeg seeks. It keeps up to 100 ready frames in memory around the selected frame. If a frame has not finished loading yet, the preview/timeline shows a black placeholder until the real frame is ready.
+The loader tracks both the selected frame and the timeline preview position; selected frame loading is highest priority, timeline preview loading is second priority, and moving targets load ahead in their movement direction.
+Long videos use virtual frame and timeline lists, so opening or jumping deep into a file does not allocate one Python object per frame.
+Interactive edits update the in-memory frame immediately, then save the newest pending version to disk in the background so editing can continue while the file write catches up.
+Frame > Reload Frame From Source discards the current frame's local edit/buffer and reloads that one frame from the original source.
+
+Export safety
+High quality GIF export warns before exporting more than 500 frames. GIF is best for short loops; use MP4 or PNG frames for longer clips.
+Whole-file edit operations such as color match, magic outline, remove by color, and RMBG are disabled by default above 500 frames. Editing is also capped at 500 changed frames per session; export/save and reopen to continue on another section.
+Whole-video RIFE also defaults to a 500-frame limit because it stages input PNGs, output PNGs, and final edited PNGs locally.
+
 Optional background removal
 Background removal uses rembg if it is installed. The editor still works without it, but the Background > Remove BG options will show an install message.
 
