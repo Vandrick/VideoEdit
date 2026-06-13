@@ -31,6 +31,7 @@ LOG_PATH = Path("VideoEdit.log")
 APPEND_TEMP_DIR = TEMP_DIR / "_append_video"
 EXPORT_TEMP_DIR = TEMP_DIR / "_export_frames"
 SMART_EXPORT_DIR = TEMP_DIR / "_smart_export"
+EDIT_CHUNK_DIR = TEMP_DIR / "_edit_chunks"
 BG = (18, 18, 18)
 PANEL = (28, 28, 28)
 TEXT = (235, 235, 235)
@@ -68,6 +69,7 @@ VIDEO_PLAYER_JUMP_RESET_FRAMES = DISK_PRELOAD_WORKER_CHUNK_SIZE
 FULL_CACHE_RADIUS = MEMORY_PRELOAD_AFTER
 VIDEO_FRAME_BUFFER_LIMIT = 500
 ENABLE_FRAME_SWITCH_PROFILING = False
+ENABLE_LOGGING = False
 FRAME_SWITCH_PROFILE_MIN_MS = 4.0
 THUMB_SPACING = 8
 TIMELINE_SIDE_PAD = 20
@@ -79,6 +81,8 @@ GIF_EXPORT_WARNING_FRAMES = 500
 LARGE_OPERATION_FRAME_LIMIT = 500
 EDITED_FRAME_LIMIT = 500
 RIFE_FRAME_LIMIT = 500
+EDIT_CHUNK_SEAL_DISTANCE = 300
+EDIT_CHUNK_MIN_FRAMES = 2
 SUPPORTED_VIDEO_TYPES = ".mp4 .mov .avi .mkv .webm .m4v .gif"
 SUPPORTED_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".gif"}
 DEFAULT_IMAGE_FPS = 16.0
@@ -156,6 +160,8 @@ KEY_NAME_ALIASES = {
 
 
 def append_log(message):
+    if not ENABLE_LOGGING:
+        return
     try:
         with LOG_LOCK:
             with LOG_PATH.open("a", encoding="utf-8") as log_file:
@@ -573,6 +579,7 @@ class FrameEditorApp:
         self.source_mask_frame_indexes = set()
         self.frame_buffer_order = []
         self.disk_frame_indexes = set()
+        self.protected_frame_read_indexes = set()
         self.frame_buffer_lock = threading.RLock()
         self.preload_lock = threading.Lock()
         self.preload_queue = []
@@ -637,6 +644,14 @@ class FrameEditorApp:
         self.save_queue = {}
         self.save_versions = {}
         self.save_running = False
+        self.frame_storage = {}
+        self.compressed_frame_bytes = {}
+        self.compress_queue = {}
+        self.compress_running = False
+        self.compress_lock = threading.Lock()
+        self.edit_chunks = {}
+        self.edit_chunk_running = False
+        self.edit_chunk_lock = threading.Lock()
         self.source_save_lock = threading.Lock()
         self.source_save_queue = {}
         self.source_save_running = False
@@ -686,6 +701,9 @@ class FrameEditorApp:
         self.color_wheel_photo = None
         self.color_tool_refresh = None
         self.color_match_method = "HM"
+        self.color_adjust_hue = 0
+        self.color_adjust_saturation = 100
+        self.color_adjust_brightness = 100
         self.color_blend_prev_weight = 25.0
         self.color_blend_current_weight = 50.0
         self.color_blend_next_weight = 25.0
@@ -735,6 +753,7 @@ class FrameEditorApp:
 
         self.tk_root = Tk()
         self.tk_root.withdraw()
+        self.create_wait_popup()
         self.load_hotkeys()
         self.check_ffmpeg_on_startup()
 
@@ -933,27 +952,81 @@ class FrameEditorApp:
             except Exception:
                 pass
 
-    def show_wait_popup(self, message="Please Wait..."):
+    def create_wait_popup(self):
         try:
             if self.wait_popup is not None and self.wait_popup.winfo_exists():
-                if self.wait_label is not None:
-                    self.wait_label.configure(text=message)
-                self.wait_popup.lift()
-            else:
-                popup = Toplevel(self.tk_root)
-                popup.title("Please Wait")
-                popup.resizable(False, False)
-                popup.transient(self.tk_root)
-                self.wait_popup = popup
-                main = Frame(popup, padx=26, pady=18)
-                main.pack()
-                self.wait_label = Label(main, text=message, width=34, anchor="center")
-                self.wait_label.pack()
-                popup.protocol("WM_DELETE_WINDOW", lambda: None)
+                return
+            popup = Toplevel(self.tk_root)
+            popup.title("Please Wait")
+            popup.resizable(False, False)
+            self.wait_popup = popup
+            main = Frame(popup, padx=28, pady=20)
+            main.pack()
+            self.wait_label = Label(main, text="Please Wait...", width=36, anchor="center")
+            self.wait_label.pack()
+            popup.protocol("WM_DELETE_WINDOW", lambda: None)
+            popup.update_idletasks()
+            width = popup.winfo_width()
+            height = popup.winfo_height()
+            x = max(0, (popup.winfo_screenwidth() - width) // 2)
+            y = max(0, (popup.winfo_screenheight() - height) // 2)
+            popup.geometry(f"+{x}+{y}")
+            popup.withdraw()
+            self.tk_root.update_idletasks()
+        except Exception:
+            self.wait_popup = None
+            self.wait_label = None
+
+    def show_wait_popup(self, message="Please Wait..."):
+        try:
+            self.create_wait_popup()
+            if self.wait_popup is None or not self.wait_popup.winfo_exists():
+                return
+            if self.wait_label is not None:
+                self.wait_label.configure(text=message)
+            self.wait_popup.deiconify()
+            self.wait_popup.lift()
+            try:
+                self.wait_popup.attributes("-topmost", True)
+                self.wait_popup.update_idletasks()
+                self.wait_popup.update()
+                self.wait_popup.attributes("-topmost", False)
+            except Exception:
+                pass
             self.tk_root.update_idletasks()
             self.tk_root.update()
         except Exception:
             pass
+
+    def draw_app_frame_once(self):
+        self.screen.fill(BG)
+        self.draw_top_bar()
+        self.draw_preview()
+        self.draw_timeline()
+        if self.active_menu is not None:
+            self.draw_active_menu()
+        pygame.display.flip()
+
+    def pump_visible_ui_frame(self):
+        try:
+            pygame.event.pump()
+            self.tk_root.update_idletasks()
+            self.tk_root.update()
+            self.draw_app_frame_once()
+            self.tk_root.update_idletasks()
+            self.tk_root.update()
+        except Exception:
+            pass
+
+    def begin_long_operation(self, wait_message="Please Wait...", loading_message=None):
+        if loading_message is not None:
+            self.loading_message = loading_message
+        else:
+            self.loading_message = wait_message.replace("Please Wait...", "").strip() or wait_message
+        self.show_wait_popup(wait_message)
+        self.pump_visible_ui_frame()
+        time.sleep(0.03)
+        self.pump_visible_ui_frame()
 
     def update_wait_popup(self, message=None):
         try:
@@ -962,20 +1035,17 @@ class FrameEditorApp:
                     self.wait_label.configure(text=message)
                 self.tk_root.update_idletasks()
                 self.tk_root.update()
+                self.pump_visible_ui_frame()
         except Exception:
             pass
 
     def hide_wait_popup(self):
-        popup = self.wait_popup
-        self.wait_popup = None
-        self.wait_label = None
-        if popup is not None:
-            try:
-                if popup.winfo_exists():
-                    popup.destroy()
+        try:
+            if self.wait_popup is not None and self.wait_popup.winfo_exists():
+                self.wait_popup.withdraw()
                 self.tk_root.update_idletasks()
-            except Exception:
-                pass
+        except Exception:
+            pass
 
     def set_active_tool(self, tool_name):
         if self.active_tool == tool_name:
@@ -1308,6 +1378,7 @@ class FrameEditorApp:
             self.frame_buffer_order.clear()
         self.mask_frame_indexes.clear()
         self.source_mask_frame_indexes.clear()
+        self.clear_edit_storage_state()
         return True
 
     def reset_frame_source_state(self):
@@ -1317,6 +1388,7 @@ class FrameEditorApp:
         self.edited_frame_indexes = set()
         self.mask_frame_indexes = set()
         self.source_mask_frame_indexes = set()
+        self.clear_edit_storage_state()
         with self.frame_buffer_lock:
             self.frame_buffer_order = []
             self.disk_frame_indexes = set()
@@ -1382,6 +1454,37 @@ class FrameEditorApp:
         MASK_TEMP_DIR.mkdir(parents=True, exist_ok=True)
         SOURCE_MASK_TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
+    def clear_edit_storage_state(self):
+        with self.compress_lock:
+            self.frame_storage.clear()
+            self.compressed_frame_bytes.clear()
+            self.compress_queue.clear()
+            self.compress_running = False
+        with self.edit_chunk_lock:
+            self.edit_chunks.clear()
+            self.edit_chunk_running = False
+        if EDIT_CHUNK_DIR.exists():
+            self.retry_file_operation("clear edit chunks", lambda: shutil.rmtree(EDIT_CHUNK_DIR), EDIT_CHUNK_DIR, show_error=False)
+        EDIT_CHUNK_DIR.mkdir(parents=True, exist_ok=True)
+
+    def clear_stale_edited_frame_state(self, index, reason="missing edited frame"):
+        self.edited_frame_indexes.discard(index)
+        self.mask_frame_indexes.discard(index)
+        self.unmark_disk_frame_index(index)
+        with self.compress_lock:
+            self.compressed_frame_bytes.pop(index, None)
+            self.compress_queue.pop(index, None)
+            self.frame_storage.pop(index, None)
+        self.remove_frame_from_buffer(index)
+        with self.cache_lock:
+            self.pil_cache.pop(index, None)
+            self.pygame_cache_pending_set.discard(index)
+            self.pygame_cache_pending = [item for item in self.pygame_cache_pending if item != index]
+        self.full_cache.pop(index, None)
+        self.thumb_cache.pop(index, None)
+        self.large_thumb_cache.pop(index, None)
+        append_log(f"stale_edit_cleared index={index} reason={reason}")
+
     def trim_disk_frame_indexes(self):
         with self.frame_buffer_lock:
             self.disk_frame_indexes = {index for index in self.disk_frame_indexes if 0 <= index < len(self.frame_paths)}
@@ -1400,7 +1503,7 @@ class FrameEditorApp:
             target = self.get_target_frame()
             keep = set(self.centered_frame_indexes_for_target(target, DISK_PRELOAD_BEFORE, DISK_PRELOAD_AFTER))
             for index in list(self.frame_buffer_order):
-                if index in self.edited_frame_indexes or index in keep:
+                if index in self.edited_frame_indexes or index in keep or index in self.protected_frame_read_indexes:
                     continue
                 path = self.frame_temp_path(index)
                 self.unlink_path_quiet(path)
@@ -1411,7 +1514,7 @@ class FrameEditorApp:
                 index = max(self.frame_buffer_order, key=lambda item: abs(item - target))
                 if index in self.frame_buffer_order:
                     self.frame_buffer_order.remove(index)
-                if index in self.edited_frame_indexes:
+                if index in self.edited_frame_indexes or index in self.protected_frame_read_indexes:
                     continue
                 path = self.frame_temp_path(index)
                 self.unlink_path_quiet(path)
@@ -2586,33 +2689,57 @@ class FrameEditorApp:
         path = Path(path)
         index = self.frame_index_from_temp_path(path)
         if index is None:
+            if "export" in str(path).lower():
+                append_log(f"resolve_non_temp path={path}")
             return path, False
 
         if index in self.edited_frame_indexes:
             if path.exists():
                 self.mark_disk_frame_index(index)
+                append_log(f"resolve_edited_disk index={index} path={path}")
                 return path, False
-            return None, False
+            with self.compress_lock:
+                has_compressed = index in self.compressed_frame_bytes
+            if self.frame_has_read_mask(index) or has_compressed:
+                append_log(f"resolve_edited_memory_or_mask index={index} path={path}")
+                return None, False
+            append_log(
+                f"resolve_missing_edit index={index} path={path} "
+                f"disk={int(self.has_disk_frame_index(index))} "
+                f"mask={int(index in self.mask_frame_indexes)}"
+            )
+            self.clear_stale_edited_frame_state(index)
 
         if self.has_disk_frame_index(index):
-            if self.frame_source_type == "video" and index not in self.edited_frame_indexes:
-                self.note_frame_buffer_access(index)
-            return path, False
+            if path.exists():
+                if self.frame_source_type == "video" and index not in self.edited_frame_indexes:
+                    self.note_frame_buffer_access(index)
+                append_log(f"resolve_buffer_disk index={index} path={path}")
+                return path, False
+            append_log(f"resolve_stale_disk_index index={index} path={path}")
+            self.unmark_disk_frame_index(index)
 
         if self.frame_source_type == "images" and index < len(self.source_frame_paths):
             source = self.source_frame_paths[index]
             if source is not None:
+                append_log(f"resolve_source_image index={index} source={source}")
                 return source, False
 
         if self.frame_source_type == "video":
             if allow_async:
                 self.queue_frame_preload(index)
+                append_log(f"resolve_video_async index={index}")
                 return None, False
+            append_log(f"resolve_video_extract_start index={index} path={path}")
             if self.extract_video_frame(index, path):
-                if index not in self.edited_frame_indexes:
-                    self.note_frame_buffer_access(index)
+                self.note_frame_buffer_access(index)
+                append_log(f"resolve_video_extract_ok index={index} path={path}")
                 return path, False
+            append_log(f"resolve_video_extract_failed index={index} path={path}")
 
+        if not path.exists():
+            append_log(f"resolve_missing_path index={index} path={path}")
+            return None, False
         return path, False
 
     def make_black_frame_surface(self):
@@ -2644,9 +2771,183 @@ class FrameEditorApp:
         with self.cache_lock:
             image = self.pil_cache.get(index)
             if image is None:
-                return None
-            cached = image.copy()
-        return cached.convert(mode) if mode else cached
+                cached = None
+            else:
+                cached = image.copy()
+        if cached is not None:
+            return cached.convert(mode) if mode else cached
+
+        compressed = self.get_compressed_frame_image(index, mode)
+        if compressed is not None:
+            return compressed
+        return None
+
+    def get_compressed_frame_image(self, index, mode="RGBA"):
+        with self.compress_lock:
+            data = self.compressed_frame_bytes.get(index)
+        if data is None:
+            return None
+        try:
+            with Image.open(io.BytesIO(data)) as image:
+                return image.convert(mode).copy() if mode else image.copy()
+        except Exception:
+            return None
+
+    def mark_frame_storage(self, index, kind, **extra):
+        if index is None or index < 0:
+            return
+        entry = {"kind": kind, "updated": time.time()}
+        entry.update(extra)
+        with self.compress_lock:
+            self.frame_storage[index] = entry
+
+    def enqueue_frame_compression(self, index, image):
+        if index < 0 or index >= len(self.frame_paths):
+            return
+        with self.save_lock:
+            version = self.save_versions.get(index, 0)
+        with self.compress_lock:
+            self.compress_queue[index] = (version, image.convert("RGBA").copy())
+            self.frame_storage[index] = {"kind": "raw", "version": version, "updated": time.time()}
+            if self.compress_running:
+                return
+            self.compress_running = True
+        threading.Thread(target=self.frame_compress_worker, daemon=True).start()
+
+    def frame_compress_worker(self):
+        while True:
+            with self.compress_lock:
+                if not self.compress_queue:
+                    self.compress_running = False
+                    return
+                index, (version, image) = self.compress_queue.popitem()
+            try:
+                buffer = io.BytesIO()
+                image.save(buffer, format="PNG", optimize=True)
+                data = buffer.getvalue()
+            except Exception:
+                continue
+            with self.save_lock:
+                latest_version = self.save_versions.get(index, 0)
+            with self.compress_lock:
+                if version != latest_version or index in self.mask_frame_indexes:
+                    continue
+                self.compressed_frame_bytes[index] = data
+                self.frame_storage[index] = {
+                    "kind": "compressed",
+                    "version": version,
+                    "bytes": len(data),
+                    "updated": time.time(),
+                }
+            self.schedule_edit_chunk_seal()
+
+    def schedule_edit_chunk_seal(self):
+        if not self.frames:
+            return
+        with self.edit_chunk_lock:
+            if self.edit_chunk_running:
+                return
+            self.edit_chunk_running = True
+        threading.Thread(target=self.edit_chunk_seal_worker, daemon=True).start()
+
+    def edit_chunk_seal_worker(self):
+        try:
+            ffmpeg = self.find_app_tool("ffmpeg")
+            if not ffmpeg:
+                return
+            target = self.get_target_frame()
+            with self.compress_lock:
+                candidates = [
+                    index for index in sorted(self.compressed_frame_bytes.keys())
+                    if index in self.edited_frame_indexes
+                    and index not in self.mask_frame_indexes
+                    and abs(index - target) > EDIT_CHUNK_SEAL_DISTANCE
+                    and self.frame_storage.get(index, {}).get("kind") != "chunk"
+                ]
+            if not candidates:
+                return
+
+            groups = []
+            current = [candidates[0]]
+            for index in candidates[1:]:
+                if index == current[-1] + 1:
+                    current.append(index)
+                else:
+                    if len(current) >= EDIT_CHUNK_MIN_FRAMES:
+                        groups.append(current)
+                    current = [index]
+            if len(current) >= EDIT_CHUNK_MIN_FRAMES:
+                groups.append(current)
+
+            for group in groups:
+                self.seal_edit_chunk(ffmpeg, group)
+        finally:
+            with self.edit_chunk_lock:
+                self.edit_chunk_running = False
+
+    def seal_edit_chunk(self, ffmpeg, indexes):
+        if not indexes:
+            return False
+        start = indexes[0]
+        end = indexes[-1] + 1
+        EDIT_CHUNK_DIR.mkdir(parents=True, exist_ok=True)
+        work_dir = EDIT_CHUNK_DIR / f"_frames_{start:06d}_{end:06d}"
+        output_path = EDIT_CHUNK_DIR / f"edit_{start:06d}_{end:06d}.mp4"
+        try:
+            if work_dir.exists():
+                shutil.rmtree(work_dir, ignore_errors=True)
+            work_dir.mkdir(parents=True, exist_ok=True)
+            for offset, index in enumerate(indexes, start=1):
+                image = self.get_compressed_frame_image(index, "RGBA")
+                if image is None:
+                    image = self.open_image_copy(self.frame_paths[index], "RGBA", "open frame for edit chunk")
+                if image is None:
+                    return False
+                try:
+                    image.save(work_dir / f"frame_{offset:06d}.png")
+                finally:
+                    image.close()
+            subprocess.run(
+                [
+                    ffmpeg,
+                    "-y",
+                    "-framerate",
+                    str(self.fps),
+                    "-i",
+                    str(work_dir / "frame_%06d.png"),
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-force_key_frames",
+                    "0",
+                    str(output_path),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=True,
+            )
+            if not output_path.exists():
+                return False
+            with self.edit_chunk_lock:
+                self.edit_chunks[(start, end)] = str(output_path)
+            with self.compress_lock:
+                for index in indexes:
+                    self.compressed_frame_bytes.pop(index, None)
+                    self.frame_storage[index] = {
+                        "kind": "chunk",
+                        "chunk": str(output_path),
+                        "chunk_start": start,
+                        "chunk_end": end,
+                        "updated": time.time(),
+                    }
+            return True
+        except Exception as exc:
+            append_log(f"edit_chunk_error start={start} end={end} error={type(exc).__name__}")
+            return False
+        finally:
+            if work_dir.exists():
+                shutil.rmtree(work_dir, ignore_errors=True)
 
     def pygame_surface_from_pil(self, image):
         image = image.convert("RGBA")
@@ -2847,6 +3148,10 @@ class FrameEditorApp:
             self.mark_disk_frame_index(index)
             self.edited_frame_indexes.add(index)
             self.mask_frame_indexes.discard(index)
+            with self.compress_lock:
+                entry = self.frame_storage.get(index)
+                if entry is None or entry.get("kind") == "mask":
+                    self.frame_storage[index] = {"kind": "full_disk", "updated": time.time()}
             self.remove_frame_from_buffer(index)
 
     def force_redraw(self):
@@ -3225,7 +3530,7 @@ class FrameEditorApp:
         self.remove_frame_from_buffer(index)
 
         if self.frame_source_type == "video":
-            self.show_wait_popup("Please Wait... Reloading frame")
+            self.begin_long_operation("Please Wait... Reloading frame", "Reloading frame...")
             try:
                 if not self.extract_video_frame(index, path):
                     self.set_status("Could not reload frame from source")
@@ -3630,6 +3935,7 @@ class FrameEditorApp:
         if not edits:
             return []
         keyframes = self.get_video_keyframe_indexes()
+        append_log(f"smart_edits count={len(edits)} indexes={','.join(str(index) for index in edits[:40])}")
 
         expanded = []
         for index in edits:
@@ -3646,6 +3952,13 @@ class FrameEditorApp:
             end = self.smart_output_index_for_source_at_or_after(source_end)
             if end <= start:
                 end = min(len(self.frame_paths), start + 1)
+            if start <= max(1, int(round(self.fps * 3.0))):
+                append_log(f"smart_range_extend_to_start old_start={start} end={end} edit={index}")
+                start = 0
+            append_log(
+                f"smart_range_edit edit={index} source={source_index} "
+                f"source_start={source_start} source_end={source_end} output_start={start} output_end={end}"
+            )
             expanded.append((start, end))
 
         expanded.sort()
@@ -3655,7 +3968,9 @@ class FrameEditorApp:
                 merged.append([start, end])
             else:
                 merged[-1][1] = max(merged[-1][1], end)
-        return [(start, min(end, len(self.frame_paths))) for start, end in merged]
+        ranges = [(start, min(end, len(self.frame_paths))) for start, end in merged]
+        append_log(f"smart_ranges {','.join(f'{start}-{end}' for start, end in ranges)}")
+        return ranges
 
     def write_concat_list(self, segment_paths, list_path):
         def escaped(path):
@@ -3672,6 +3987,10 @@ class FrameEditorApp:
     def run_ffmpeg_segment_copy(self, ffmpeg, start_frame, end_frame, output_path):
         start_time = start_frame / max(self.fps, 0.001)
         duration = max(0.001, (end_frame - start_frame) / max(self.fps, 0.001))
+        append_log(
+            f"video_segment_copy source_start={start_frame} source_end={end_frame} "
+            f"start_time={start_time:.6f} duration={duration:.6f} path={output_path}"
+        )
         subprocess.run(
             [
                 ffmpeg,
@@ -3687,6 +4006,43 @@ class FrameEditorApp:
                 "-an",
                 "-c:v",
                 "copy",
+                "-avoid_negative_ts",
+                "make_zero",
+                str(output_path),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+
+    def run_ffmpeg_segment_encode_source(self, ffmpeg, start_frame, end_frame, output_path):
+        start_time = start_frame / max(self.fps, 0.001)
+        duration = max(0.001, (end_frame - start_frame) / max(self.fps, 0.001))
+        append_log(
+            f"video_segment_source_encode source_start={start_frame} source_end={end_frame} "
+            f"start_time={start_time:.6f} duration={duration:.6f} path={output_path}"
+        )
+        subprocess.run(
+            [
+                ffmpeg,
+                "-y",
+                "-ss",
+                f"{start_time:.6f}",
+                "-i",
+                str(self.video_path),
+                "-t",
+                f"{duration:.6f}",
+                "-map",
+                "0:v:0",
+                "-an",
+                "-r",
+                str(self.fps),
+                "-fps_mode",
+                "cfr",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
                 str(output_path),
             ],
             stdout=subprocess.DEVNULL,
@@ -3700,6 +4056,116 @@ class FrameEditorApp:
         source_start = self.source_frame_indexes[start_index]
         source_end = self.source_frame_indexes[end_index - 1] + 1
         self.run_ffmpeg_segment_copy(ffmpeg, source_start, source_end, output_path)
+
+    def run_ffmpeg_output_range_encode_source(self, ffmpeg, start_index, end_index, output_path):
+        if start_index >= end_index:
+            return
+        source_start = self.source_frame_indexes[start_index]
+        source_end = self.source_frame_indexes[end_index - 1] + 1
+        self.run_ffmpeg_segment_encode_source(ffmpeg, source_start, source_end, output_path)
+
+    def original_audio_input_args(self):
+        if self.video_path is None:
+            return []
+        source_start = 0
+        if self.frame_source_type == "video" and self.source_frame_indexes:
+            source_start = max(0, int(self.source_frame_indexes[0]))
+        start_time = source_start / max(self.fps, 0.001)
+        append_log(f"audio_input_offset source_start={source_start} start_time={start_time:.6f}")
+        if start_time > 0:
+            return ["-ss", f"{start_time:.6f}", "-i", str(self.video_path)]
+        return ["-i", str(self.video_path)]
+
+    def source_audio_ranges(self):
+        if self.video_path is None or self.frame_source_type != "video" or not self.source_frame_indexes:
+            return []
+        ranges = []
+        start = int(self.source_frame_indexes[0])
+        previous = start
+        for source_index in self.source_frame_indexes[1:]:
+            source_index = int(source_index)
+            if source_index == previous + 1:
+                previous = source_index
+                continue
+            ranges.append((start, previous + 1))
+            start = source_index
+            previous = source_index
+        ranges.append((start, previous + 1))
+        return ranges
+
+    def build_timeline_audio(self, ffmpeg, output_path):
+        ranges = self.source_audio_ranges()
+        if not ranges:
+            return False
+        audio_dir = SMART_EXPORT_DIR / "audio_segments"
+        if not self.clear_work_folder(audio_dir, "clear smart export audio"):
+            return False
+        segment_paths = []
+        try:
+            for segment_number, (start_frame, end_frame) in enumerate(ranges, start=1):
+                start_time = start_frame / max(self.fps, 0.001)
+                duration = max(0.001, (end_frame - start_frame) / max(self.fps, 0.001))
+                segment_path = audio_dir / f"audio_{segment_number:04d}.m4a"
+                append_log(
+                    f"audio_segment number={segment_number} "
+                    f"source_start={start_frame} source_end={end_frame} "
+                    f"start_time={start_time:.6f} duration={duration:.6f}"
+                )
+                subprocess.run(
+                    [
+                        ffmpeg,
+                        "-y",
+                        "-ss",
+                        f"{start_time:.6f}",
+                        "-i",
+                        str(self.video_path),
+                        "-t",
+                        f"{duration:.6f}",
+                        "-vn",
+                        "-map",
+                        "0:a?",
+                        "-c:a",
+                        "aac",
+                        segment_path,
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=True,
+                )
+                if segment_path.exists() and segment_path.stat().st_size > 0:
+                    segment_paths.append(segment_path)
+
+            if not segment_paths:
+                return False
+            if len(segment_paths) == 1:
+                return self.copy_path_retry(segment_paths[0], output_path, "copy timeline audio")
+
+            concat_list = audio_dir / "audio_segments.txt"
+            if not self.write_concat_list(segment_paths, concat_list):
+                return False
+            append_log(f"audio_concat segments={len(segment_paths)}")
+            subprocess.run(
+                [
+                    ffmpeg,
+                    "-y",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    str(concat_list),
+                    "-c",
+                    "copy",
+                    output_path,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=True,
+            )
+            return output_path.exists() and output_path.stat().st_size > 0
+        except (OSError, subprocess.CalledProcessError) as exc:
+            append_log(f"audio_build_failed error={type(exc).__name__}")
+            return False
 
     def stage_frame_range_for_export(self, start_frame, end_frame, output_dir):
         if not self.check_export_staging_size(end_frame - start_frame, "smart edited segment"):
@@ -3727,6 +4193,7 @@ class FrameEditorApp:
         frames_dir = SMART_EXPORT_DIR / "range_frames"
         if not self.stage_frame_range_for_export(start_frame, end_frame, frames_dir):
             return False
+        append_log(f"video_segment_encode output_start={start_frame} output_end={end_frame} frames={end_frame - start_frame} path={output_path}")
         subprocess.run(
             [
                 ffmpeg,
@@ -3735,6 +4202,10 @@ class FrameEditorApp:
                 str(self.fps),
                 "-i",
                 str(frames_dir / "frame_%06d.png"),
+                "-r",
+                str(self.fps),
+                "-fps_mode",
+                "cfr",
                 "-c:v",
                 "libx264",
                 "-pix_fmt",
@@ -3763,16 +4234,18 @@ class FrameEditorApp:
         try:
             for start, end in ranges:
                 if cursor < start:
-                    path = SMART_EXPORT_DIR / f"segment_{segment_number:04d}_copy.mp4"
-                    self.loading_message = f"Copying original segment {segment_number}..."
+                    path = SMART_EXPORT_DIR / f"segment_{segment_number:04d}_source.mp4"
+                    self.loading_message = f"Encoding original segment {segment_number}..."
                     self.force_redraw()
-                    self.run_ffmpeg_output_range_copy(ffmpeg, cursor, start, path)
+                    append_log(f"smart_segment number={segment_number} type=source_encode output_start={cursor} output_end={start}")
+                    self.run_ffmpeg_output_range_encode_source(ffmpeg, cursor, start, path)
                     segment_paths.append(path)
                     segment_number += 1
 
                 path = SMART_EXPORT_DIR / f"segment_{segment_number:04d}_edit.mp4"
                 self.loading_message = f"Encoding edited segment {segment_number}..."
                 self.force_redraw()
+                append_log(f"smart_segment number={segment_number} type=edit output_start={start} output_end={end}")
                 if not self.run_ffmpeg_range_encode(ffmpeg, start, end, path):
                     return False
                 segment_paths.append(path)
@@ -3780,10 +4253,11 @@ class FrameEditorApp:
                 cursor = end
 
             if cursor < len(self.frame_paths):
-                path = SMART_EXPORT_DIR / f"segment_{segment_number:04d}_copy.mp4"
-                self.loading_message = f"Copying original segment {segment_number}..."
+                path = SMART_EXPORT_DIR / f"segment_{segment_number:04d}_source.mp4"
+                self.loading_message = f"Encoding original segment {segment_number}..."
                 self.force_redraw()
-                self.run_ffmpeg_output_range_copy(ffmpeg, cursor, len(self.frame_paths), path)
+                append_log(f"smart_segment number={segment_number} type=source_encode output_start={cursor} output_end={len(self.frame_paths)}")
+                self.run_ffmpeg_output_range_encode_source(ffmpeg, cursor, len(self.frame_paths), path)
                 segment_paths.append(path)
 
             concat_video = SMART_EXPORT_DIR / "_smart_video_only.mp4"
@@ -3792,6 +4266,7 @@ class FrameEditorApp:
                 return False
             self.loading_message = "Joining smart export segments..."
             self.force_redraw()
+            append_log(f"smart_concat_reencode segments={len(segment_paths)} path={concat_video}")
             subprocess.run(
                 [
                     ffmpeg,
@@ -3802,8 +4277,15 @@ class FrameEditorApp:
                     "0",
                     "-i",
                     str(concat_list),
-                    "-c",
-                    "copy",
+                    "-an",
+                    "-r",
+                    str(self.fps),
+                    "-fps_mode",
+                    "cfr",
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv420p",
                     str(concat_video),
                 ],
                 stdout=subprocess.DEVNULL,
@@ -3811,14 +4293,17 @@ class FrameEditorApp:
                 check=True,
             )
 
+            timeline_audio = SMART_EXPORT_DIR / "_smart_audio.m4a"
+            has_timeline_audio = self.build_timeline_audio(ffmpeg, timeline_audio)
+            append_log(f"smart_mux_timeline_audio ready={int(has_timeline_audio)} path={timeline_audio}")
+            audio_input = ["-i", str(timeline_audio)] if has_timeline_audio else self.original_audio_input_args()
             subprocess.run(
                 [
                     ffmpeg,
                     "-y",
                     "-i",
                     str(concat_video),
-                    "-i",
-                    str(self.video_path),
+                    *audio_input,
                     "-map",
                     "0:v:0",
                     "-map",
@@ -3858,7 +4343,7 @@ class FrameEditorApp:
         if not save_path:
             return
 
-        self.show_wait_popup("Please Wait... Exporting video")
+        self.begin_long_operation("Please Wait... Exporting video", "Exporting video...")
         try:
             if self.video_path is not None and not self.has_video_frame_changes():
                 if self.copy_path_retry(self.video_path, save_path, "copy original video"):
@@ -3912,14 +4397,17 @@ class FrameEditorApp:
             if self.video_path is not None:
                 self.update_wait_popup("Please Wait... Adding audio")
                 try:
+                    fallback_audio = TEMP_DIR / "_timeline_audio.m4a"
+                    has_timeline_audio = self.build_timeline_audio(ffmpeg, fallback_audio)
+                    append_log(f"full_mux_timeline_audio ready={int(has_timeline_audio)} path={fallback_audio}")
+                    audio_input = ["-i", str(fallback_audio)] if has_timeline_audio else self.original_audio_input_args()
                     subprocess.run(
                         [
                             ffmpeg,
                             "-y",
                             "-i",
                             str(temp_video),
-                            "-i",
-                            str(self.video_path),
+                            *audio_input,
                             "-map",
                             "0:v:0",
                             "-map",
@@ -3968,7 +4456,7 @@ class FrameEditorApp:
         if not save_path:
             return
 
-        self.show_wait_popup("Please Wait... Exporting GIF")
+        self.begin_long_operation("Please Wait... Exporting GIF", "Exporting GIF...")
         try:
             width, height, output_fps = self.get_retarget_settings()
             if not self.stage_all_frames_for_export(EXPORT_TEMP_DIR, "RGBA"):
@@ -4072,9 +4560,7 @@ class FrameEditorApp:
         return command
 
     def run_rife_command(self, command, rife, label):
-        self.loading_message = label
-        self.show_wait_popup(f"Please Wait... {label}")
-        self.force_redraw()
+        self.begin_long_operation(f"Please Wait... {label}", label)
         try:
             subprocess.run(command, cwd=str(Path(rife).resolve().parent), check=True)
         except (OSError, subprocess.CalledProcessError) as exc:
@@ -4448,7 +4934,9 @@ class FrameEditorApp:
                 del self.full_cache[key]
         with self.cache_lock:
             for key in list(self.pil_cache.keys()):
-                if key not in keep and (key not in self.edited_frame_indexes or key in self.mask_frame_indexes):
+                with self.compress_lock:
+                    compressed_ready = key in self.compressed_frame_bytes
+                if key not in keep and (key not in self.edited_frame_indexes or key in self.mask_frame_indexes or compressed_ready):
                     del self.pil_cache[key]
             self.pygame_cache_pending = [index for index in self.pygame_cache_pending if index in keep]
             self.pygame_cache_pending_set = set(self.pygame_cache_pending)
@@ -4685,6 +5173,8 @@ class FrameEditorApp:
         if not fast_navigation and self.color_popup is not None and self.color_popup.winfo_exists() and self.color_tool_refresh is not None:
             self.color_tool_refresh()
         profile_mark("color")
+        if not fast_navigation:
+            self.schedule_edit_chunk_seal()
         self.report_frame_switch_profile(old_index, index, profile_start, profile_sections)
 
     def report_frame_switch_profile(self, old_index, new_index, started_at, sections):
@@ -4910,20 +5400,45 @@ class FrameEditorApp:
 
     def open_image_copy(self, path, mode="RGBA", action="open image"):
         index = self.frame_index_from_temp_path(path)
+        trace_open = "smart export" in action.lower()
+        protect_read = trace_open and index is not None
+        if protect_read:
+            with self.frame_buffer_lock:
+                self.protected_frame_read_indexes.add(index)
+            append_log(f"open_image_protect action={action} index={index} path={path}")
+        try:
+            return self.open_image_copy_locked(path, mode, action, index, trace_open)
+        finally:
+            if protect_read:
+                with self.frame_buffer_lock:
+                    self.protected_frame_read_indexes.discard(index)
+                append_log(f"open_image_unprotect action={action} index={index} path={path}")
+
+    def open_image_copy_locked(self, path, mode="RGBA", action="open image", index=None, trace_open=False):
         if index is not None:
             cached = self.get_cached_pil_frame(index, mode)
             if cached is not None:
+                if trace_open:
+                    append_log(f"open_image_cache action={action} index={index} path={path}")
                 return cached
             if self.frame_has_read_mask(index):
+                if trace_open:
+                    append_log(f"open_image_mask action={action} index={index} path={path}")
                 image = self.compose_masked_frame_image(index, "RGBA")
                 if image is None:
+                    if trace_open:
+                        append_log(f"open_image_mask_failed action={action} index={index} path={path}")
                     return None
                 self.cache_pil_frame(index, image, queue_pygame=True)
                 return image.convert(mode) if mode else image
 
         read_path, transient = self.resolve_frame_read_path(path)
         if read_path is None:
+            if trace_open:
+                append_log(f"open_image_no_read_path action={action} index={index} path={path}")
             return None
+        if trace_open:
+            append_log(f"open_image_resolved action={action} index={index} path={path} read_path={read_path}")
 
         def operation():
             with Image.open(read_path) as image:
@@ -5059,6 +5574,7 @@ class FrameEditorApp:
         with self.wand_zone_lock:
             self.wand_zone_cache.pop(index, None)
         self.enqueue_frame_save(index, image)
+        self.enqueue_frame_compression(index, image)
         self.preview_surface = None
         self.preview_surface_key = None
         self.needs_preview_refresh = True
@@ -5077,6 +5593,14 @@ class FrameEditorApp:
 
         self.edited_frame_indexes.add(index)
         self.mask_frame_indexes.add(index)
+        with self.compress_lock:
+            self.compressed_frame_bytes.pop(index, None)
+            self.compress_queue.pop(index, None)
+            self.frame_storage[index] = {
+                "kind": "mask",
+                "path": str(self.frame_mask_path(index)),
+                "updated": time.time(),
+            }
         self.unlink_path_quiet(self.frame_temp_path(index))
         self.remove_frame_from_buffer(index)
         self.cache_pil_frame(index, image, queue_pygame=True)
@@ -5408,8 +5932,7 @@ class FrameEditorApp:
         reference = self.get_selected_reference_image()
         if reference is None:
             return
-        self.loading_message = "Color matching video to selected frame..."
-        self.force_redraw()
+        self.begin_long_operation("Please Wait... Color matching video", "Color matching video to selected frame...")
         try:
             for i, path in enumerate(self.frame_paths):
                 if i == reference_index:
@@ -5426,6 +5949,8 @@ class FrameEditorApp:
             self.loading_message = ""
             self.set_status(str(exc))
             return
+        finally:
+            self.hide_wait_popup()
 
         self.invalidate_frame_cache()
         self.prime_caches_near_current()
@@ -5629,20 +6154,22 @@ class FrameEditorApp:
             except ValueError:
                 status_var.set("Hue values must be numbers")
                 return
-            self.loading_message = "Erasing color range..."
-            self.force_redraw()
-            for i in range(len(self.frame_paths)):
-                self.loading_message = f"Erasing color range... {i + 1}/{len(self.frame_paths)}"
-                if i % 5 == 0:
-                    self.force_redraw()
-                if not self.apply_color_range_selection_to_frame(i, hue_a, hue_b, low, high, 0):
-                    self.loading_message = ""
-                    return
-            self.loading_message = ""
-            self.invalidate_frame_cache()
-            self.prime_caches_near_current()
-            self.rebuild_timeline_metrics()
-            self.set_status("Erased color range on all frames", 5000)
+            self.begin_long_operation("Please Wait... Erasing color range", "Erasing color range...")
+            try:
+                for i in range(len(self.frame_paths)):
+                    self.loading_message = f"Erasing color range... {i + 1}/{len(self.frame_paths)}"
+                    if i % 5 == 0:
+                        self.update_wait_popup(self.loading_message)
+                    if not self.apply_color_range_selection_to_frame(i, hue_a, hue_b, low, high, 0):
+                        self.loading_message = ""
+                        return
+                self.loading_message = ""
+                self.invalidate_frame_cache()
+                self.prime_caches_near_current()
+                self.rebuild_timeline_metrics()
+                self.set_status("Erased color range on all frames", 5000)
+            finally:
+                self.hide_wait_popup()
 
         def close_popup():
             self.close_color_range_tools()
@@ -5718,16 +6245,17 @@ class FrameEditorApp:
 
         Label(main, text="Hue").grid(row=3, column=0, sticky="w", pady=(10, 0))
         hue_scale = Scale(main, from_=-180, to=180, orient=HORIZONTAL, length=320, resolution=1)
+        hue_scale.set(self.color_adjust_hue)
         hue_scale.grid(row=3, column=1, columnspan=3, sticky="ew", pady=(10, 0))
 
         Label(main, text="Saturation").grid(row=4, column=0, sticky="w")
         sat_scale = Scale(main, from_=0, to=200, orient=HORIZONTAL, length=320, resolution=1)
-        sat_scale.set(100)
+        sat_scale.set(self.color_adjust_saturation)
         sat_scale.grid(row=4, column=1, columnspan=3, sticky="ew")
 
         Label(main, text="Brightness").grid(row=5, column=0, sticky="w")
         brightness_scale = Scale(main, from_=0, to=200, orient=HORIZONTAL, length=320, resolution=1)
-        brightness_scale.set(100)
+        brightness_scale.set(self.color_adjust_brightness)
         brightness_scale.grid(row=5, column=1, columnspan=3, sticky="ew")
 
         weights_frame = Frame(main)
@@ -5753,6 +6281,9 @@ class FrameEditorApp:
             return ImageTk.PhotoImage(preview)
 
         def update_color_preview(_value=None):
+            self.color_adjust_hue = hue_scale.get()
+            self.color_adjust_saturation = sat_scale.get()
+            self.color_adjust_brightness = brightness_scale.get()
             adjusted = make_adjusted()
             photo = make_preview_photo(adjusted, (300, 220))
             frame_preview.configure(image=photo)
@@ -5817,9 +6348,6 @@ class FrameEditorApp:
             if image is None:
                 return
             base_image = image
-            hue_scale.set(0)
-            sat_scale.set(100)
-            brightness_scale.set(100)
             ref_var.set(f"Selected frame {self.current_index} is the reference")
             update_reference_previews()
             update_color_preview()
@@ -6871,9 +7399,7 @@ class FrameEditorApp:
             return
         if not self.can_write_frame_edits(range(len(self.frame_paths))):
             return
-        self.loading_message = "Adding magic outline..."
-        self.show_wait_popup("Please Wait... Adding magic outline")
-        self.force_redraw()
+        self.begin_long_operation("Please Wait... Adding magic outline", "Adding magic outline...")
         try:
             for i in range(len(self.frame_paths)):
                 self.loading_message = f"Adding magic outline... {i + 1}/{len(self.frame_paths)}"
@@ -6906,9 +7432,7 @@ class FrameEditorApp:
             return
         if not self.can_write_frame_edits(range(len(self.frame_paths))):
             return
-        self.loading_message = "Clearing magic outline..."
-        self.show_wait_popup("Please Wait... Clearing magic outline")
-        self.force_redraw()
+        self.begin_long_operation("Please Wait... Clearing magic outline", "Clearing magic outline...")
         try:
             for i in range(len(self.frame_paths)):
                 self.loading_message = f"Clearing magic outline... {i + 1}/{len(self.frame_paths)}"
@@ -6995,10 +7519,8 @@ class FrameEditorApp:
     def remove_background_current_frame(self):
         if not self.frames:
             return
-        self.loading_message = "Removing background... please wait"
         self.set_status("Removing background; this can take a while", 5000)
-        self.show_wait_popup("Please Wait... Removing background")
-        self.force_redraw()
+        self.begin_long_operation("Please Wait... Removing background", "Removing background... please wait")
         try:
             self.remove_background_from_frame(self.current_index)
         except Exception as exc:
@@ -7020,10 +7542,8 @@ class FrameEditorApp:
             return
         if not self.can_write_frame_edits(range(len(self.frame_paths))):
             return
-        self.loading_message = "Removing backgrounds... please wait"
         self.set_status("Removing backgrounds; this can take a while", 5000)
-        self.show_wait_popup("Please Wait... Removing backgrounds")
-        self.force_redraw()
+        self.begin_long_operation("Please Wait... Removing backgrounds", "Removing backgrounds... please wait")
         try:
             for i in range(len(self.frames)):
                 self.loading_message = f"Removing backgrounds... {i + 1}/{len(self.frames)}"
@@ -7220,6 +7740,7 @@ class FrameEditorApp:
 
     def reset_after_frame_list_change(self):
         self.clear_preload_queue()
+        self.clear_edit_storage_state()
         self.full_cache.clear()
         with self.cache_lock:
             self.pil_cache.clear()
@@ -7257,7 +7778,7 @@ class FrameEditorApp:
         image = self.open_image_copy(self.frame_paths[self.current_index], "RGBA", "open current frame")
         if image is None:
             return
-        self.show_wait_popup("Please Wait... Saving frame")
+        self.begin_long_operation("Please Wait... Saving frame", "Saving frame...")
         try:
             if not self.save_image_retry(image, save_path, "export current frame"):
                 return
@@ -7285,9 +7806,7 @@ class FrameEditorApp:
         base_name = self.get_export_base_name()
         total = len(self.frame_paths)
 
-        self.loading_message = "Exporting frames..."
-        self.show_wait_popup("Please Wait... Exporting frames")
-        self.force_redraw()
+        self.begin_long_operation("Please Wait... Exporting frames", "Exporting frames...")
         try:
             for i, path in enumerate(self.frame_paths, start=1):
                 self.loading_message = f"Exporting frames... {i}/{total}"
@@ -7612,6 +8131,122 @@ class FrameEditorApp:
             self.retarget_fps = None
             self.set_status("Deleted last frame")
 
+    def trim_to_frame_range(self, keep_start, keep_end, label):
+        if not self.frames:
+            return
+        frame_count = len(self.frame_paths)
+        keep_start = max(0, min(frame_count - 1, int(keep_start)))
+        keep_end = max(keep_start + 1, min(frame_count, int(keep_end)))
+        if keep_start == 0 and keep_end == frame_count:
+            self.set_status("Nothing to cut")
+            return
+
+        self.clear_preload_queue()
+        self.wait_for_pending_frame_saves()
+        self.release_file_caches()
+
+        kept_count = keep_end - keep_start
+        with self.frame_buffer_lock:
+            disk_indexes = set(self.disk_frame_indexes)
+        mask_indexes = set(self.mask_frame_indexes)
+        source_mask_indexes = set(self.source_mask_frame_indexes)
+        for old_index in sorted(disk_indexes):
+            if not (keep_start <= old_index < keep_end):
+                self.unlink_path_quiet(self.frame_temp_path(old_index))
+        for old_index in sorted(mask_indexes):
+            if not (keep_start <= old_index < keep_end):
+                self.unlink_path_quiet(self.frame_mask_path(old_index))
+        for old_index in sorted(source_mask_indexes):
+            if not (keep_start <= old_index < keep_end):
+                self.unlink_path_quiet(self.frame_source_mask_path(old_index))
+
+        kept_disk_indexes = sorted(index for index in disk_indexes if keep_start <= index < keep_end)
+        kept_mask_indexes = sorted(index for index in mask_indexes if keep_start <= index < keep_end)
+        kept_source_mask_indexes = sorted(index for index in source_mask_indexes if keep_start <= index < keep_end)
+
+        for old_index in kept_disk_indexes:
+            new_index = old_index - keep_start
+            if old_index == new_index:
+                continue
+            src = self.frame_temp_path(old_index)
+            dst = self.frame_temp_path(new_index)
+            if src.exists() and not self.rename_path_retry(src, dst):
+                return
+        for old_index in kept_mask_indexes:
+            new_index = old_index - keep_start
+            if old_index == new_index:
+                continue
+            src = self.frame_mask_path(old_index)
+            dst = self.frame_mask_path(new_index)
+            if src.exists() and not self.rename_path_retry(src, dst):
+                return
+        for old_index in kept_source_mask_indexes:
+            new_index = old_index - keep_start
+            if old_index == new_index:
+                continue
+            src = self.frame_source_mask_path(old_index)
+            dst = self.frame_source_mask_path(new_index)
+            if src.exists() and not self.rename_path_retry(src, dst):
+                return
+
+        if self.frame_source_type == "images":
+            self.source_frame_paths = self.source_frame_paths[keep_start:keep_end]
+        elif self.frame_source_type == "video":
+            self.source_frame_indexes = self.source_frame_indexes[keep_start:keep_end]
+
+        kept_edited = set()
+        for index in self.edited_frame_indexes:
+            if not (keep_start <= index < keep_end):
+                continue
+            has_backing = (
+                index in mask_indexes
+                or index in disk_indexes
+                or self.frame_temp_path(index).exists()
+                or self.frame_mask_path(index).exists()
+            )
+            if has_backing:
+                kept_edited.add(index - keep_start)
+            else:
+                append_log(f"trim_dropped_stale_edit index={index}")
+        self.edited_frame_indexes = kept_edited
+        self.mask_frame_indexes = {
+            index - keep_start
+            for index in self.mask_frame_indexes
+            if keep_start <= index < keep_end
+        }
+        self.source_mask_frame_indexes = {
+            index - keep_start
+            for index in self.source_mask_frame_indexes
+            if keep_start <= index < keep_end
+        }
+        self.frame_buffer_order = [
+            index - keep_start
+            for index in self.frame_buffer_order
+            if keep_start <= index < keep_end
+        ]
+
+        self.set_virtual_frame_list(kept_count)
+        self.current_index = max(0, min(self.current_index - keep_start, kept_count - 1))
+        self.set_loader_targets(self.current_index)
+        self.reset_after_frame_list_change()
+        self.set_status(f"{label}; kept {kept_count} frames", 5000)
+
+    def cut_before_current_frame(self):
+        if not self.frames:
+            return
+        if self.current_index <= 0:
+            self.set_status("Already at first frame")
+            return
+        self.trim_to_frame_range(self.current_index, len(self.frame_paths), "Cut before current frame")
+
+    def cut_after_current_frame(self):
+        if not self.frames:
+            return
+        if self.current_index >= len(self.frame_paths) - 1:
+            self.set_status("Already at last frame")
+            return
+        self.trim_to_frame_range(0, self.current_index + 1, "Cut after current frame")
+
     # ---------- menu ----------
     def close_menus(self):
         self.file_menu_open = False
@@ -7716,6 +8351,8 @@ class FrameEditorApp:
             ("RIFE Blend Loop Seam", "", self.rife_blend_loop, can_loop_blend),
             ("Export Current Frame...", "", self.export_current_frame, bool(self.frames)),
             ("Delete Current Frame", self.hotkey_label("delete_frame_or_mask"), self.delete_current_frame, bool(self.frames)),
+            ("Cut Before Current", "", self.cut_before_current_frame, bool(self.frames) and self.current_index > 0),
+            ("Cut After Current", "", self.cut_after_current_frame, bool(self.frames) and self.current_index < len(self.frames) - 1),
             ("Reload Frame From Source", "", self.reload_current_frame_from_source, self.can_reload_current_frame_from_source()),
             ("Jump To Frame/Time...", self.hotkey_label("jump_to_frame"), self.open_jump_to_frame, bool(self.frames)),
             ("First Frame", self.hotkey_label("first_frame"), lambda: self.set_current_index(0), bool(self.frames)),
@@ -8079,6 +8716,7 @@ class FrameEditorApp:
         self.clamp_preview_offset()
         self.prime_caches_near_current()
         self.schedule_wand_zone_preload()
+        self.schedule_edit_chunk_seal()
         if self.color_popup is not None and self.color_popup.winfo_exists() and self.color_tool_refresh is not None:
             self.color_tool_refresh()
 
