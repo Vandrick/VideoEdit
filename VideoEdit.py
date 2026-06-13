@@ -6,6 +6,7 @@ import ctypes
 import importlib
 import io
 import gc
+import os
 import time
 import threading
 import re
@@ -13,7 +14,7 @@ import configparser
 from pathlib import Path
 
 import pygame
-from PIL import Image, ImageEnhance, ImageGrab, ImageTk
+from PIL import Image, ImageEnhance, ImageGrab, ImageSequence, ImageTk
 from tkinter import Tk, Toplevel, Label, Entry, Button, Frame, StringVar, Scale, HORIZONTAL, OptionMenu, Text, filedialog, messagebox
 
 try:
@@ -22,6 +23,9 @@ except ImportError:
     cv2 = None
 
 TEMP_DIR = Path("temp_frames")
+MASK_TEMP_DIR = TEMP_DIR / "_masks"
+SOURCE_MASK_TEMP_DIR = TEMP_DIR / "_source_masks"
+GIF_SOURCE_DIR = TEMP_DIR / "_gif_source"
 CONFIG_PATH = Path("VideoEdit.ini")
 LOG_PATH = Path("VideoEdit.log")
 APPEND_TEMP_DIR = TEMP_DIR / "_append_video"
@@ -551,6 +555,7 @@ def get_file_clipboard_paths():
 
 class FrameEditorApp:
     def __init__(self):
+        os.environ.setdefault("SDL_MOUSE_FOCUS_CLICKTHROUGH", "1")
         pygame.init()
         pygame.display.set_caption("Video Frame Editor")
         self.screen = pygame.display.set_mode((WINDOW_W, WINDOW_H), pygame.RESIZABLE)
@@ -564,6 +569,8 @@ class FrameEditorApp:
         self.source_frame_paths = []
         self.source_frame_indexes = []
         self.edited_frame_indexes = set()
+        self.mask_frame_indexes = set()
+        self.source_mask_frame_indexes = set()
         self.frame_buffer_order = []
         self.disk_frame_indexes = set()
         self.frame_buffer_lock = threading.RLock()
@@ -648,6 +655,7 @@ class FrameEditorApp:
         self.last_drag_dx = 0.0
         self.click_candidate = False
         self.click_down_pos = (0, 0)
+        self.focus_click_replay_until = 0.0
 
         self.preview_zoom = 1.0
         self.preview_offset = [0.0, 0.0]
@@ -700,6 +708,15 @@ class FrameEditorApp:
         self.wand_preload_thread = None
         self.wand_preload_targets = []
         self.wand_preload_running = False
+        self.wand_cleanup_popup = None
+        self.wand_cleanup_points = []
+        self.wand_cleanup_clear_tolerance = 75
+        self.wand_cleanup_restore_tolerance = 50
+        self.wand_cleanup_clear_var = None
+        self.wand_cleanup_restore_var = None
+        self.wand_cleanup_show_points = False
+        self.wand_cleanup_drag_index = None
+        self.wand_cleanup_last_moved_index = None
         self.preview_background = "Checker"
         self.background_toggle_rect = pygame.Rect(0, 0, 120, 34)
         self.rembg_settings_popup = None
@@ -986,6 +1003,8 @@ class FrameEditorApp:
             self.close_rembg_settings()
         elif previous == "magic_outline":
             self.close_magic_outline_tools()
+        elif previous == "wand_cleanup":
+            self.close_wand_cleanup_tool()
 
         self.active_tool = tool_name
         return True
@@ -996,6 +1015,7 @@ class FrameEditorApp:
         self.close_color_range_tools()
         self.close_rembg_settings()
         self.close_magic_outline_tools()
+        self.close_wand_cleanup_tool()
         self.close_selection_tools()
         self.active_tool = None
         self.mask_edit_mode = False
@@ -1016,6 +1036,9 @@ class FrameEditorApp:
             self.wand_zone_cache.clear()
             self.wand_preload_targets = []
             self.wand_preload_running = False
+        self.wand_cleanup_points = []
+        self.wand_cleanup_drag_index = None
+        self.wand_cleanup_last_moved_index = None
         self.reset_frame_source_state()
 
     # ---------- ffmpeg ----------
@@ -1278,9 +1301,13 @@ class FrameEditorApp:
             if result is None and TEMP_DIR.exists():
                 return False
         TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        MASK_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        SOURCE_MASK_TEMP_DIR.mkdir(parents=True, exist_ok=True)
         with self.frame_buffer_lock:
             self.disk_frame_indexes.clear()
             self.frame_buffer_order.clear()
+        self.mask_frame_indexes.clear()
+        self.source_mask_frame_indexes.clear()
         return True
 
     def reset_frame_source_state(self):
@@ -1288,6 +1315,8 @@ class FrameEditorApp:
         self.source_frame_paths = []
         self.source_frame_indexes = []
         self.edited_frame_indexes = set()
+        self.mask_frame_indexes = set()
+        self.source_mask_frame_indexes = set()
         with self.frame_buffer_lock:
             self.frame_buffer_order = []
             self.disk_frame_indexes = set()
@@ -1296,6 +1325,12 @@ class FrameEditorApp:
 
     def frame_temp_path(self, index):
         return TEMP_DIR / f"frame_{index + 1:06d}.png"
+
+    def frame_mask_path(self, index):
+        return MASK_TEMP_DIR / f"mask_{index + 1:06d}.png"
+
+    def frame_source_mask_path(self, index):
+        return SOURCE_MASK_TEMP_DIR / f"mask_{index + 1:06d}.png"
 
     def set_virtual_frame_list(self, count):
         self.frame_paths = VirtualFramePaths(count, self.frame_temp_path)
@@ -1336,6 +1371,16 @@ class FrameEditorApp:
     def clear_disk_frame_indexes(self):
         with self.frame_buffer_lock:
             self.disk_frame_indexes.clear()
+
+    def clear_mask_frame_indexes(self):
+        self.mask_frame_indexes.clear()
+        self.source_mask_frame_indexes.clear()
+        if MASK_TEMP_DIR.exists():
+            self.retry_file_operation("clear alpha masks", lambda: shutil.rmtree(MASK_TEMP_DIR), MASK_TEMP_DIR, show_error=False)
+        if SOURCE_MASK_TEMP_DIR.exists():
+            self.retry_file_operation("clear source alpha masks", lambda: shutil.rmtree(SOURCE_MASK_TEMP_DIR), SOURCE_MASK_TEMP_DIR, show_error=False)
+        MASK_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        SOURCE_MASK_TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
     def trim_disk_frame_indexes(self):
         with self.frame_buffer_lock:
@@ -2100,6 +2145,8 @@ class FrameEditorApp:
     def get_ready_frame_read_path(self, index):
         if index < 0 or index >= len(self.frame_paths):
             return None
+        if self.frame_has_read_mask(index):
+            return None
         path = self.frame_paths[index]
         if self.has_disk_frame_index(index):
             return path
@@ -2117,6 +2164,15 @@ class FrameEditorApp:
         index = int(number) - 1
         return index
 
+    def raw_frame_index_from_mask_path(self, path):
+        path = Path(path)
+        if path.parent != MASK_TEMP_DIR or not path.name.startswith("mask_") or path.suffix.lower() != ".png":
+            return None
+        number = path.stem.removeprefix("mask_")
+        if not number.isdigit():
+            return None
+        return int(number) - 1
+
     def frame_index_from_temp_path(self, path):
         index = self.raw_frame_index_from_temp_path(path)
         if index is None:
@@ -2124,6 +2180,26 @@ class FrameEditorApp:
         if index < 0 or index >= len(self.frame_paths):
             return None
         return index
+
+    def frame_index_from_mask_path(self, path):
+        index = self.raw_frame_index_from_mask_path(path)
+        if index is None:
+            return None
+        if index < 0 or index >= len(self.frame_paths):
+            return None
+        return index
+
+    def frame_has_read_mask(self, index):
+        if index in self.mask_frame_indexes:
+            return True
+        return index not in self.edited_frame_indexes and index in self.source_mask_frame_indexes
+
+    def frame_read_mask_path(self, index):
+        if index in self.mask_frame_indexes:
+            return self.frame_mask_path(index)
+        if index not in self.edited_frame_indexes and index in self.source_mask_frame_indexes:
+            return self.frame_source_mask_path(index)
+        return None
 
     def extract_video_frame(self, index, destination):
         if self.video_path is None:
@@ -2706,11 +2782,71 @@ class FrameEditorApp:
             return
         self.unlink_path_retry(Path(path), show_error=False)
 
+    def open_source_image_copy(self, index, mode="RGBA", action="open source frame"):
+        if index < 0 or index >= len(self.frame_paths):
+            return None
+
+        read_path = None
+        transient_source = False
+        if self.frame_source_type == "images" and index < len(self.source_frame_paths):
+            read_path = self.source_frame_paths[index]
+        elif self.frame_source_type == "video" and self.video_path is not None:
+            if index in self.mask_frame_indexes:
+                read_path = MASK_TEMP_DIR / f".source_{index + 1:06d}_{threading.get_ident()}.png"
+                transient_source = True
+                if not self.extract_video_frame(index, read_path):
+                    return None
+            else:
+                read_path = self.frame_temp_path(index)
+                if not read_path.exists() or not self.has_disk_frame_index(index):
+                    if not self.extract_video_frame(index, read_path):
+                        return None
+        else:
+            read_path = self.frame_paths[index]
+
+        if read_path is None:
+            return None
+
+        def operation():
+            with Image.open(read_path) as image:
+                return image.convert(mode).copy() if mode else image.copy()
+
+        try:
+            return self.retry_file_operation(action, operation, read_path)
+        finally:
+            if transient_source:
+                self.unlink_path_quiet(read_path)
+
+    def compose_masked_frame_image(self, index, mode="RGBA"):
+        mask_path = self.frame_read_mask_path(index)
+        if mask_path is None:
+            return None
+        if not mask_path.exists():
+            return None
+
+        image = self.open_source_image_copy(index, "RGBA", "open source for mask edit")
+        if image is None:
+            return None
+
+        def read_mask():
+            with Image.open(mask_path) as mask_image:
+                return mask_image.convert("L").copy()
+
+        mask = self.retry_file_operation("open alpha mask", read_mask, mask_path)
+        if mask is None:
+            image.close()
+            return None
+        if mask.size != image.size:
+            mask = mask.resize(image.size, Image.Resampling.NEAREST)
+        image.putalpha(mask)
+        return image.convert(mode) if mode else image
+
     def mark_edited_frame_path(self, path):
         index = self.frame_index_from_temp_path(path)
         if index is not None:
             self.mark_disk_frame_index(index)
             self.edited_frame_indexes.add(index)
+            self.mask_frame_indexes.discard(index)
             self.remove_frame_from_buffer(index)
 
     def force_redraw(self):
@@ -2722,10 +2858,118 @@ class FrameEditorApp:
             self.draw_active_menu()
         pygame.display.flip()
 
+    def detect_gif_fps(self, path):
+        try:
+            with Image.open(path) as image:
+                durations = [
+                    int(getattr(frame, "info", {}).get("duration", 0) or image.info.get("duration", 0) or 0)
+                    for frame in ImageSequence.Iterator(image)
+                ]
+            durations = [duration for duration in durations if duration > 0]
+            if durations:
+                return max(1.0, min(120.0, 1000.0 / (sum(durations) / len(durations))))
+        except Exception:
+            pass
+        return DEFAULT_IMAGE_FPS
+
+    def open_gif_path(self, path, restore_state=None):
+        path = Path(path)
+        if not path.exists():
+            self.set_status("File not found")
+            return
+
+        self.close_menus()
+        self.reset_tools_for_new_media()
+        self.loading_message = f"Opening {path.name}..."
+        self.force_redraw()
+
+        if not self.clear_temp_frames():
+            self.loading_message = ""
+            return
+
+        source_paths = []
+        mask_indexes = set()
+        try:
+            GIF_SOURCE_DIR.mkdir(parents=True, exist_ok=True)
+            with Image.open(path) as image:
+                for index, frame in enumerate(ImageSequence.Iterator(image)):
+                    self.loading_message = f"Opening GIF... {index + 1}"
+                    if index == 0 or index % 10 == 0:
+                        self.force_redraw()
+                    rgba = frame.convert("RGBA")
+                    source_path = GIF_SOURCE_DIR / f"frame_{index + 1:06d}.png"
+                    if not self.save_image_retry(rgba.convert("RGB"), source_path, "save GIF source frame"):
+                        self.loading_message = ""
+                        return
+                    alpha = rgba.getchannel("A")
+                    if self.alpha_has_transparency(alpha):
+                        if not self.save_mask_image_retry(alpha, self.frame_source_mask_path(index), "save GIF alpha mask"):
+                            self.loading_message = ""
+                            return
+                        mask_indexes.add(index)
+                    source_paths.append(source_path)
+        except Exception as exc:
+            self.loading_message = ""
+            self.show_file_error("open GIF", path, exc)
+            return
+
+        if not source_paths:
+            self.loading_message = ""
+            self.set_status("GIF has no frames", 5000)
+            return
+
+        self.video_path = None
+        self.media_name = path.stem
+        self.frame_source_type = "images"
+        self.source_frame_paths = source_paths
+        self.source_frame_indexes = []
+        self.edited_frame_indexes = set()
+        self.mask_frame_indexes = set()
+        self.source_mask_frame_indexes = mask_indexes
+        self.fps = self.detect_gif_fps(path)
+        self.reset_loader_batch_sizes()
+        self.set_virtual_frame_list(len(source_paths))
+        restore_state = restore_state or {}
+        restore_index = int(restore_state.get("current_index", 0))
+        self.current_index = max(0, min(restore_index, len(source_paths) - 1))
+        self.set_loader_targets(self.current_index)
+        self.initialize_retarget_settings()
+        self.scroll_x = float(restore_state.get("scroll_x", 0.0))
+        self.scroll_velocity = 0.0
+        self.preview_zoom = float(restore_state.get("preview_zoom", 1.0))
+        self.preview_offset = list(restore_state.get("preview_offset", [0.0, 0.0]))
+
+        self.full_cache.clear()
+        self.thumb_cache.clear()
+        self.large_thumb_cache.clear()
+        with self.wand_zone_lock:
+            self.wand_zone_cache.clear()
+            self.wand_preload_targets = []
+        self.base_thumb_sizes = []
+        self.large_thumb_sizes = []
+        self.prefix_positions = []
+        self.timeline_total_width = 0
+        self.preview_surface = None
+        self.preview_surface_key = None
+        self.needs_preview_refresh = True
+
+        self.prime_caches_near_current()
+        self.rebuild_timeline_metrics()
+        if restore_state:
+            self.clamp_scroll()
+        else:
+            self.center_selected()
+        self.schedule_wand_zone_preload()
+        self.loading_message = ""
+        self.set_status(f"Opened GIF with {len(source_paths)} frames and {len(mask_indexes)} alpha masks", 5000)
+
     def open_video_path(self, path, restore_state=None):
         path = Path(path)
         if not path.exists():
             self.set_status("File not found")
+            return
+        if path.suffix.lower() == ".gif":
+            self.open_gif_path(path, restore_state=restore_state)
             return
         if path.suffix.lower() not in SUPPORTED_VIDEO_EXTS:
             self.set_status("Unsupported video or animation file")
@@ -2746,6 +2990,7 @@ class FrameEditorApp:
         self.video_path = path
         self.media_name = path.stem
         self.frame_source_type = "video"
+        self.mask_frame_indexes = set()
         self.loading_message = "Reading video info..."
         self.force_redraw()
         self.fps = self.detect_fps(self.video_path)
@@ -2975,6 +3220,8 @@ class FrameEditorApp:
         self.release_file_caches()
         self.unlink_path_retry(path, show_error=False)
         self.edited_frame_indexes.discard(index)
+        self.mask_frame_indexes.discard(index)
+        self.unlink_path_quiet(self.frame_mask_path(index))
         self.remove_frame_from_buffer(index)
 
         if self.frame_source_type == "video":
@@ -3856,11 +4103,13 @@ class FrameEditorApp:
                 return False
 
         output_count = len(output_paths)
+        self.clear_mask_frame_indexes()
         self.frame_source_type = "images"
         self.source_frame_paths = [None] * output_count
         self.source_frame_indexes = []
         self.set_virtual_frame_list(output_count)
         self.edited_frame_indexes = set(range(output_count))
+        self.mask_frame_indexes = set()
         self.frame_buffer_order = []
         self.current_index = min(self.current_index * multiplier, max(0, len(self.frames) - 1))
         self.set_loader_targets(self.current_index)
@@ -3964,11 +4213,13 @@ class FrameEditorApp:
                 return False
 
         output_count = len(prepared)
+        self.clear_mask_frame_indexes()
         self.frame_source_type = "images"
         self.source_frame_paths = [None] * output_count
         self.source_frame_indexes = []
         self.set_virtual_frame_list(output_count)
         self.edited_frame_indexes = set(range(output_count))
+        self.mask_frame_indexes = set()
         self.frame_buffer_order = []
         self.current_index = max(0, min(current_index, len(self.frames) - 1))
         self.set_loader_targets(self.current_index)
@@ -4142,6 +4393,16 @@ class FrameEditorApp:
         if cached is not None:
             return self.pygame_surface_from_pil(cached), True
 
+        if self.frame_has_read_mask(index):
+            image = self.compose_masked_frame_image(index, "RGBA")
+            if image is None:
+                return self.make_black_frame_surface(), False
+            try:
+                self.cache_pil_frame(index, image, queue_pygame=False)
+                return self.pygame_surface_from_pil(image), True
+            finally:
+                image.close()
+
         path = self.frame_paths[index]
         read_path, transient = self.resolve_frame_read_path(path, allow_async=allow_async)
         if read_path is None:
@@ -4187,7 +4448,7 @@ class FrameEditorApp:
                 del self.full_cache[key]
         with self.cache_lock:
             for key in list(self.pil_cache.keys()):
-                if key not in keep and key not in self.edited_frame_indexes:
+                if key not in keep and (key not in self.edited_frame_indexes or key in self.mask_frame_indexes):
                     del self.pil_cache[key]
             self.pygame_cache_pending = [index for index in self.pygame_cache_pending if index in keep]
             self.pygame_cache_pending_set = set(self.pygame_cache_pending)
@@ -4398,6 +4659,11 @@ class FrameEditorApp:
         self.set_loader_targets(index)
         self.wand_selection = None
         self.wand_dragging = False
+        if self.wand_cleanup_points:
+            self.wand_cleanup_points = []
+            self.wand_cleanup_drag_index = None
+            self.wand_cleanup_last_moved_index = None
+            self.set_status("Cleared cleanup points for new frame")
         self.close_selection_tools()
         profile_mark("select")
         self.preview_surface = None
@@ -4648,6 +4914,12 @@ class FrameEditorApp:
             cached = self.get_cached_pil_frame(index, mode)
             if cached is not None:
                 return cached
+            if self.frame_has_read_mask(index):
+                image = self.compose_masked_frame_image(index, "RGBA")
+                if image is None:
+                    return None
+                self.cache_pil_frame(index, image, queue_pygame=True)
+                return image.convert(mode) if mode else image
 
         read_path, transient = self.resolve_frame_read_path(path)
         if read_path is None:
@@ -4673,6 +4945,28 @@ class FrameEditorApp:
             image.save(path)
             self.mark_disk_frame_path(path)
             self.mark_edited_frame_path(path)
+            return True
+
+        return bool(self.retry_file_operation(action, operation, path))
+
+    def alpha_storage_image(self, alpha):
+        alpha = alpha.convert("L")
+        colors = alpha.getcolors(3)
+        if colors is not None and all(value in (0, 255) for _count, value in colors):
+            return alpha.convert("1", dither=Image.Dither.NONE)
+        return alpha
+
+    def alpha_has_transparency(self, alpha):
+        extrema = alpha.convert("L").getextrema()
+        return extrema is not None and extrema[0] < 255
+
+    def save_mask_image_retry(self, alpha, path, action="save alpha mask"):
+        path = Path(path)
+        mask = self.alpha_storage_image(alpha)
+
+        def operation():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            mask.save(path)
             return True
 
         return bool(self.retry_file_operation(action, operation, path))
@@ -4756,6 +5050,8 @@ class FrameEditorApp:
         if not self.can_write_frame_edit(index):
             return False
         image = image.convert("RGBA")
+        self.mask_frame_indexes.discard(index)
+        self.unlink_path_quiet(self.frame_mask_path(index))
         self.mark_edited_frame_path(self.frame_paths[index])
         self.cache_pil_frame(index, image, queue_pygame=True)
         for cache in (self.full_cache, self.thumb_cache, self.large_thumb_cache):
@@ -4770,6 +5066,36 @@ class FrameEditorApp:
             self.process_pending_pygame_cache(limit=1)
             self.schedule_wand_zone_preload()
         return True
+
+    def save_mask_edited_frame(self, index, image):
+        if not self.can_write_frame_edit(index):
+            return False
+        image = image.convert("RGBA")
+        alpha = image.getchannel("A")
+        if not self.save_mask_image_retry(alpha, self.frame_mask_path(index)):
+            return False
+
+        self.edited_frame_indexes.add(index)
+        self.mask_frame_indexes.add(index)
+        self.unlink_path_quiet(self.frame_temp_path(index))
+        self.remove_frame_from_buffer(index)
+        self.cache_pil_frame(index, image, queue_pygame=True)
+        for cache in (self.full_cache, self.thumb_cache, self.large_thumb_cache):
+            cache.pop(index, None)
+        with self.wand_zone_lock:
+            self.wand_zone_cache.pop(index, None)
+        self.preview_surface = None
+        self.preview_surface_key = None
+        self.needs_preview_refresh = True
+        if index == self.current_index:
+            self.process_pending_pygame_cache(limit=1)
+            self.schedule_wand_zone_preload()
+        return True
+
+    def save_alpha_edited_frame(self, index, image):
+        if index in self.edited_frame_indexes and index not in self.mask_frame_indexes:
+            return self.save_edited_frame(index, image)
+        return self.save_mask_edited_frame(index, image)
 
     def draw_checkerboard(self, surface, rect, offset=(0, 0)):
         clip = surface.get_clip()
@@ -5157,7 +5483,7 @@ class FrameEditorApp:
             alpha = np.asarray(image.getchannel("A"), dtype=np.uint8).copy()
             alpha[region] = alpha_value
             image.putalpha(Image.fromarray(alpha, "L"))
-            if not self.save_edited_frame(index, image):
+            if not self.save_alpha_edited_frame(index, image):
                 return False
             return True
         finally:
@@ -5590,6 +5916,270 @@ class FrameEditorApp:
                 self.loading_message = ""
                 return
         self.set_status("Wand select on")
+
+    def close_wand_cleanup_tool(self):
+        popup = self.wand_cleanup_popup
+        self.wand_cleanup_popup = None
+        self.wand_cleanup_clear_var = None
+        self.wand_cleanup_restore_var = None
+        if popup is not None:
+            try:
+                if popup.winfo_exists():
+                    popup.destroy()
+            except Exception:
+                pass
+        if self.active_tool == "wand_cleanup":
+            self.active_tool = None
+
+    def open_wand_cleanup_tool(self):
+        if not self.frames:
+            self.set_status("Open a video or image before using wand cleanup")
+            return
+        if self.active_tool == "wand_cleanup" and self.wand_cleanup_popup is not None and self.wand_cleanup_popup.winfo_exists():
+            self.wand_cleanup_popup.lift()
+            return
+
+        self.set_active_tool("wand_cleanup")
+        try:
+            self.get_wand_zone_cache(self.current_index)
+        except RuntimeError as exc:
+            self.set_status(str(exc))
+            self.close_wand_cleanup_tool()
+            self.loading_message = ""
+            return
+
+        popup = Toplevel(self.tk_root)
+        popup.title("Wand Cleanup Points")
+        popup.resizable(False, False)
+        self.wand_cleanup_popup = popup
+
+        main = Frame(popup, padx=14, pady=12)
+        main.pack()
+
+        clear_var = StringVar(value=str(self.wand_cleanup_clear_tolerance))
+        restore_var = StringVar(value=str(self.wand_cleanup_restore_tolerance))
+        self.wand_cleanup_clear_var = clear_var
+        self.wand_cleanup_restore_var = restore_var
+        show_button_var = StringVar()
+
+        Label(main, text="Clear tolerance").grid(row=0, column=0, sticky="w", pady=3)
+        clear_entry = Entry(main, textvariable=clear_var, width=8)
+        clear_entry.grid(row=0, column=1, sticky="ew", padx=(12, 0), pady=3)
+        Label(main, text="Restore tolerance").grid(row=1, column=0, sticky="w", pady=3)
+        restore_entry = Entry(main, textvariable=restore_var, width=8)
+        restore_entry.grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=3)
+
+        def refresh_status():
+            show_button_var.set("Compact Points" if self.wand_cleanup_show_points else "Full Points")
+            self.force_redraw()
+
+        def parse_tolerances():
+            try:
+                clear = int(float(clear_var.get()))
+                restore = int(float(restore_var.get()))
+            except ValueError:
+                self.set_status("Tolerances must be numbers")
+                return None
+            return max(0, min(255, clear)), max(0, min(255, restore))
+
+        def clear_points():
+            self.wand_cleanup_points = []
+            self.wand_cleanup_drag_index = None
+            self.wand_cleanup_last_moved_index = None
+            refresh_status()
+
+        def apply_tool():
+            if self.apply_current_wand_cleanup_settings():
+                refresh_status()
+
+        def close_popup():
+            self.close_wand_cleanup_tool()
+            self.force_redraw()
+
+        def toggle_points():
+            self.toggle_wand_cleanup_points()
+            refresh_status()
+
+        buttons = Frame(main)
+        buttons.grid(row=4, column=0, columnspan=3, sticky="e")
+        Button(buttons, textvariable=show_button_var, command=toggle_points).pack(side="left", padx=(0, 8))
+        Button(buttons, text="Clear Points", command=clear_points).pack(side="left", padx=(0, 8))
+        Button(buttons, text="Apply", command=apply_tool).pack(side="left", padx=(0, 8))
+        Button(buttons, text="Close", command=close_popup).pack(side="left")
+
+        popup.protocol("WM_DELETE_WINDOW", close_popup)
+        def apply_from_key(_event):
+            apply_tool()
+            return "break"
+
+        for widget in (popup, clear_entry, restore_entry):
+            widget.bind("<Return>", apply_from_key)
+            widget.bind("<KP_Enter>", apply_from_key)
+        popup.bind("<Escape>", lambda _event: close_popup())
+        refresh_status()
+        self.set_status("Click preview to add cleanup points")
+
+    def toggle_wand_cleanup_points(self):
+        self.wand_cleanup_show_points = not self.wand_cleanup_show_points
+        state = "full" if self.wand_cleanup_show_points else "compact"
+        self.set_status(f"Cleanup points {state}")
+        self.force_redraw()
+
+    def add_wand_cleanup_point(self, image_pos):
+        if image_pos is None:
+            return
+        if image_pos not in self.wand_cleanup_points:
+            self.wand_cleanup_points.append(image_pos)
+            self.wand_cleanup_last_moved_index = None
+        self.set_status(f"Added cleanup point {len(self.wand_cleanup_points)}")
+        self.force_redraw()
+
+    def apply_current_wand_cleanup_settings(self):
+        try:
+            clear_value = self.wand_cleanup_clear_var.get() if self.wand_cleanup_clear_var is not None else str(self.wand_cleanup_clear_tolerance)
+            restore_value = self.wand_cleanup_restore_var.get() if self.wand_cleanup_restore_var is not None else str(self.wand_cleanup_restore_tolerance)
+            clear = int(float(clear_value))
+            restore = int(float(restore_value))
+        except (AttributeError, TypeError, ValueError):
+            self.set_status("Tolerances must be numbers")
+            return False
+
+        clear = max(0, min(255, clear))
+        restore = max(0, min(255, restore))
+        self.wand_cleanup_clear_tolerance = clear
+        self.wand_cleanup_restore_tolerance = restore
+        return self.apply_wand_cleanup_points(clear, restore)
+
+    def remove_wand_cleanup_point_at_index(self, point_index):
+        if point_index is None or not (0 <= point_index < len(self.wand_cleanup_points)):
+            return False
+        removed_number = point_index + 1
+        self.wand_cleanup_points.pop(point_index)
+        self.wand_cleanup_drag_index = None
+        if self.wand_cleanup_last_moved_index == point_index:
+            self.wand_cleanup_last_moved_index = None
+        elif self.wand_cleanup_last_moved_index is not None and self.wand_cleanup_last_moved_index > point_index:
+            self.wand_cleanup_last_moved_index -= 1
+        self.set_status(f"Deleted cleanup point {removed_number}; {len(self.wand_cleanup_points)} left")
+        self.force_redraw()
+        return True
+
+    def delete_wand_cleanup_point(self):
+        if not self.wand_cleanup_points:
+            self.set_status("No cleanup points")
+            return False
+        if self.wand_cleanup_last_moved_index is not None and 0 <= self.wand_cleanup_last_moved_index < len(self.wand_cleanup_points):
+            return self.remove_wand_cleanup_point_at_index(self.wand_cleanup_last_moved_index)
+        return self.remove_wand_cleanup_point_at_index(len(self.wand_cleanup_points) - 1)
+
+    def remove_nearest_wand_cleanup_point(self, image_pos):
+        if image_pos is None or not self.wand_cleanup_points:
+            return
+        x, y = image_pos
+        nearest_index = min(
+            range(len(self.wand_cleanup_points)),
+            key=lambda index: (self.wand_cleanup_points[index][0] - x) * (self.wand_cleanup_points[index][0] - x)
+            + (self.wand_cleanup_points[index][1] - y) * (self.wand_cleanup_points[index][1] - y),
+        )
+        self.remove_wand_cleanup_point_at_index(nearest_index)
+
+    def wand_cleanup_point_screen_positions(self):
+        if not self.frames:
+            return []
+        rect = self.get_preview_rect()
+        full = self.load_full_surface(self.current_index)
+        img_w, img_h = full.get_size()
+        fit_scale = min(rect.w / img_w, rect.h / img_h)
+        scale = max(0.05, fit_scale * self.preview_zoom)
+        draw_w = max(1, int(img_w * scale))
+        draw_h = max(1, int(img_h * scale))
+        draw_x = rect.x + (rect.w - draw_w) // 2 + int(self.preview_offset[0])
+        draw_y = rect.y + (rect.h - draw_h) // 2 + int(self.preview_offset[1])
+        return [(draw_x + int(x * scale), draw_y + int(y * scale)) for x, y in self.wand_cleanup_points]
+
+    def wand_cleanup_point_at_screen_pos(self, mouse, radius=12):
+        if not self.wand_cleanup_points:
+            return None
+        mx, my = mouse
+        best_index = None
+        best_distance = radius * radius
+        for index, (x, y) in enumerate(self.wand_cleanup_point_screen_positions()):
+            distance = (x - mx) * (x - mx) + (y - my) * (y - my)
+            if distance <= best_distance:
+                best_index = index
+                best_distance = distance
+        return best_index
+
+    def move_wand_cleanup_point(self, point_index, image_pos):
+        if image_pos is None or point_index is None:
+            return
+        if 0 <= point_index < len(self.wand_cleanup_points):
+            self.wand_cleanup_points[point_index] = image_pos
+            self.wand_cleanup_last_moved_index = point_index
+            self.force_redraw()
+
+    def build_wand_cleanup_selection(self, points, tolerance):
+        try:
+            import numpy as np
+        except ImportError:
+            raise RuntimeError("Install numpy to use wand cleanup")
+        combined = None
+        for point in points:
+            region = self.build_wand_region(point, tolerance)
+            if region is None:
+                continue
+            combined = region.copy() if combined is None else (combined | region)
+        if combined is None:
+            return None
+        return combined
+
+    def apply_wand_cleanup_points(self, clear_tolerance, restore_tolerance):
+        if not self.frames:
+            return False
+        if not self.wand_cleanup_points:
+            self.set_status("Add cleanup points first")
+            return False
+        if not self.can_write_frame_edit(self.current_index):
+            return False
+
+        try:
+            import numpy as np
+        except ImportError:
+            self.set_status("Install numpy to use wand cleanup")
+            return False
+
+        image = self.open_image_copy(self.frame_paths[self.current_index], "RGBA", "open frame for wand cleanup")
+        if image is None:
+            return False
+        try:
+            alpha = np.asarray(image.getchannel("A"), dtype=np.uint8).copy()
+            clear_region = self.build_wand_cleanup_selection(self.wand_cleanup_points, clear_tolerance)
+            restore_region = self.build_wand_cleanup_selection(self.wand_cleanup_points, restore_tolerance)
+            if clear_region is None and restore_region is None:
+                self.set_status("Cleanup points did not select anything")
+                return False
+            if clear_region is not None:
+                clear_region = self.dilate_mask(clear_region, 1)
+                if clear_region.shape != alpha.shape:
+                    self.set_status("Cleanup selection does not match frame")
+                    return False
+                alpha[clear_region] = 0
+            if restore_region is not None:
+                restore_region = ~restore_region
+                restore_region = self.erode_mask(restore_region, 3)
+                if restore_region.shape != alpha.shape:
+                    self.set_status("Cleanup selection does not match frame")
+                    return False
+                alpha[restore_region] = 255
+            image.putalpha(Image.fromarray(alpha, "L"))
+            if not self.save_alpha_edited_frame(self.current_index, image):
+                return False
+            self.prime_caches_near_current()
+            self.rebuild_timeline_metrics()
+            self.set_status(f"Wand cleanup applied using {len(self.wand_cleanup_points)} points")
+            return True
+        finally:
+            image.close()
 
     def clear_wand_selection(self):
         self.wand_selection = None
@@ -6055,7 +6645,7 @@ class FrameEditorApp:
                 return
             alpha[self.wand_selection] = alpha_value
             image.putalpha(Image.fromarray(alpha, "L"))
-            if not self.save_edited_frame(self.current_index, image):
+            if not self.save_alpha_edited_frame(self.current_index, image):
                 return
             self.prime_caches_near_current()
             self.rebuild_timeline_metrics()
@@ -6072,7 +6662,7 @@ class FrameEditorApp:
             return
         try:
             image.putalpha(0)
-            if not self.save_edited_frame(self.current_index, image):
+            if not self.save_alpha_edited_frame(self.current_index, image):
                 return
             self.set_status("Erased current frame mask")
         finally:
@@ -6086,7 +6676,7 @@ class FrameEditorApp:
             return
         try:
             image.putalpha(255)
-            if not self.save_edited_frame(self.current_index, image):
+            if not self.save_alpha_edited_frame(self.current_index, image):
                 return
             self.set_status("Filled current frame mask")
         finally:
@@ -6399,7 +6989,7 @@ class FrameEditorApp:
             removed = Image.open(io.BytesIO(result)).convert("RGBA")
 
         original.putalpha(removed.getchannel("A"))
-        if not self.save_image_retry(original, self.frame_paths[index], "save background removal result"):
+        if not self.save_alpha_edited_frame(index, original):
             raise RuntimeError("Could not save background removal result")
 
     def remove_background_current_frame(self):
@@ -6810,6 +7400,16 @@ class FrameEditorApp:
             if self.has_disk_frame_index(i):
                 if not self.rename_path_retry(src, dst):
                     return
+            if i in self.mask_frame_indexes:
+                mask_src = self.frame_mask_path(i)
+                mask_dst = self.frame_mask_path(i + 1)
+                if mask_src.exists() and not self.rename_path_retry(mask_src, mask_dst):
+                    return
+            if i in self.source_mask_frame_indexes:
+                mask_src = self.frame_source_mask_path(i)
+                mask_dst = self.frame_source_mask_path(i + 1)
+                if mask_src.exists() and not self.rename_path_retry(mask_src, mask_dst):
+                    return
 
         if not self.rename_path_retry(temp_insert, self.frame_temp_path(insert_index)):
             return
@@ -6825,11 +7425,21 @@ class FrameEditorApp:
             index if index < insert_index else index + 1
             for index in self.edited_frame_indexes
         }
+        self.mask_frame_indexes = {
+            index if index < insert_index else index + 1
+            for index in self.mask_frame_indexes
+        }
+        self.source_mask_frame_indexes = {
+            index if index < insert_index else index + 1
+            for index in self.source_mask_frame_indexes
+        }
         self.frame_buffer_order = [
             index if index < insert_index else index + 1
             for index in self.frame_buffer_order
         ]
         self.edited_frame_indexes.add(insert_index)
+        self.mask_frame_indexes.discard(insert_index)
+        self.source_mask_frame_indexes.discard(insert_index)
         self.set_virtual_frame_list(frame_count + 1)
         self.current_index = insert_index
         self.set_loader_targets(self.current_index)
@@ -6940,6 +7550,8 @@ class FrameEditorApp:
         self.wait_for_pending_frame_saves()
         self.release_file_caches()
         self.unlink_path_retry(delete_path, show_error=False)
+        self.unlink_path_quiet(self.frame_mask_path(delete_index))
+        self.unlink_path_quiet(self.frame_source_mask_path(delete_index))
 
         frame_count = len(self.frame_paths)
         for i in range(delete_index + 1, frame_count):
@@ -6947,6 +7559,16 @@ class FrameEditorApp:
             dst = self.frame_temp_path(i - 1)
             if self.has_disk_frame_index(i) and not self.rename_path_retry(src, dst):
                 return
+            if i in self.mask_frame_indexes:
+                mask_src = self.frame_mask_path(i)
+                mask_dst = self.frame_mask_path(i - 1)
+                if mask_src.exists() and not self.rename_path_retry(mask_src, mask_dst):
+                    return
+            if i in self.source_mask_frame_indexes:
+                mask_src = self.frame_source_mask_path(i)
+                mask_dst = self.frame_source_mask_path(i - 1)
+                if mask_src.exists() and not self.rename_path_retry(mask_src, mask_dst):
+                    return
 
         if self.frame_source_type == "images" and delete_index < len(self.source_frame_paths):
             self.source_frame_paths.pop(delete_index)
@@ -6956,6 +7578,16 @@ class FrameEditorApp:
         self.edited_frame_indexes = {
             index if index < delete_index else index - 1
             for index in self.edited_frame_indexes
+            if index != delete_index
+        }
+        self.mask_frame_indexes = {
+            index if index < delete_index else index - 1
+            for index in self.mask_frame_indexes
+            if index != delete_index
+        }
+        self.source_mask_frame_indexes = {
+            index if index < delete_index else index - 1
+            for index in self.source_mask_frame_indexes
             if index != delete_index
         }
         self.frame_buffer_order = [
@@ -7105,6 +7737,7 @@ class FrameEditorApp:
             (mode_label, self.hotkey_label("mask_edit"), self.toggle_mask_edit_mode, bool(self.frames)),
             (wand_label, self.hotkey_label("wand_select"), self.toggle_wand_mode, bool(self.frames)),
             ("Remove By Color...", "", self.open_color_range_tools, bool(self.frames)),
+            ("Wand Cleanup Points...", "", self.open_wand_cleanup_tool, bool(self.frames)),
             ("Selection Tools...", "", self.open_selection_tools, self.selection_is_visible()),
             ("Clear Wand Selection", "", self.clear_wand_selection, self.wand_selection is not None),
             ("Fill Current Mask", "", self.fill_current_mask, bool(self.frames)),
@@ -7178,7 +7811,33 @@ class FrameEditorApp:
             self.set_status("Drop a supported video, animation, image file, or image folder")
 
     # ---------- input ----------
+    def handle_window_focus_gained(self):
+        self.focus_click_replay_until = time.perf_counter() + 0.20
+
+    def replay_focus_click_if_needed(self):
+        if self.focus_click_replay_until <= 0:
+            return
+        now = time.perf_counter()
+        if now > self.focus_click_replay_until:
+            self.focus_click_replay_until = 0.0
+            return
+
+        try:
+            buttons = pygame.mouse.get_pressed(5)
+        except TypeError:
+            buttons = pygame.mouse.get_pressed()
+        if not any(buttons):
+            return
+
+        pos = pygame.mouse.get_pos()
+        button_map = (1, 2, 3, 4, 5)
+        button = next((button_map[i] for i, pressed in enumerate(buttons[:len(button_map)]) if pressed), 1)
+        self.focus_click_replay_until = 0.0
+        event = pygame.event.Event(pygame.MOUSEBUTTONDOWN, {"pos": pos, "button": button})
+        self.handle_mouse_button_down(event)
+
     def handle_mouse_button_down(self, event):
+        self.focus_click_replay_until = 0.0
         mouse = event.pos
         preview_rect = self.get_preview_rect()
         timeline_rect = self.get_timeline_rect()
@@ -7190,6 +7849,18 @@ class FrameEditorApp:
                 image_pos = self.preview_to_image_pos(mouse)
                 if image_pos is not None:
                     self.color_range_image_sampler(image_pos, False)
+            elif self.active_tool == "wand_cleanup" and preview_rect.collidepoint(mouse):
+                image_pos = self.preview_to_image_pos(mouse)
+                mods = pygame.key.get_mods()
+                if mods & (pygame.KMOD_CTRL | pygame.KMOD_META):
+                    self.remove_nearest_wand_cleanup_point(image_pos)
+                else:
+                    point_index = self.wand_cleanup_point_at_screen_pos(mouse)
+                    if point_index is None:
+                        self.add_wand_cleanup_point(image_pos)
+                        self.wand_cleanup_drag_index = len(self.wand_cleanup_points) - 1 if self.wand_cleanup_points else None
+                    else:
+                        self.wand_cleanup_drag_index = point_index
             elif self.wand_mode and preview_rect.collidepoint(mouse):
                 image_pos = self.preview_to_image_pos(mouse)
                 if image_pos is not None:
@@ -7235,6 +7906,12 @@ class FrameEditorApp:
                 image_pos = self.preview_to_image_pos(mouse)
                 if image_pos is not None:
                     self.color_range_image_sampler(image_pos, True)
+            elif self.active_tool == "wand_cleanup" and preview_rect.collidepoint(mouse):
+                point_index = self.wand_cleanup_point_at_screen_pos(mouse)
+                if point_index is not None:
+                    self.remove_wand_cleanup_point_at_index(point_index)
+                else:
+                    self.remove_nearest_wand_cleanup_point(self.preview_to_image_pos(mouse))
             elif self.mask_edit_mode and preview_rect.collidepoint(mouse):
                 self.mask_dragging = True
                 mods = pygame.key.get_mods()
@@ -7277,10 +7954,13 @@ class FrameEditorApp:
         self.mask_drag_combine_mode = "add"
         self.wand_dragging = False
         self.wand_drag_base = None
+        self.wand_cleanup_drag_index = None
         self.click_candidate = False
 
     def handle_mouse_motion(self, event):
-        if self.wand_dragging and self.wand_mode and self.wand_start_pos is not None:
+        if self.active_tool == "wand_cleanup" and self.wand_cleanup_drag_index is not None:
+            self.move_wand_cleanup_point(self.wand_cleanup_drag_index, self.preview_to_image_pos(event.pos))
+        elif self.wand_dragging and self.wand_mode and self.wand_start_pos is not None:
             dx = event.pos[0] - self.click_down_pos[0] if self.click_down_pos else 0
             self.wand_tolerance = max(0, min(255, self.wand_start_tolerance + int(dx / 2)))
             if self.wand_tolerance != self.wand_last_drag_tolerance:
@@ -7346,6 +8026,8 @@ class FrameEditorApp:
             self.retarget_size_fps()
         elif self.hotkey_matches(event, "preview_animation"):
             self.show_animation_preview()
+        elif self.active_tool == "wand_cleanup" and event.key == pygame.K_h:
+            self.toggle_wand_cleanup_points()
         elif self.hotkey_matches(event, "color_tools"):
             self.open_color_tools()
         elif self.hotkey_matches(event, "jump_to_frame"):
@@ -7361,12 +8043,16 @@ class FrameEditorApp:
         elif self.hotkey_matches(event, "paste_frame"):
             self.paste_frame()
         elif self.hotkey_matches(event, "delete_frame_or_mask"):
-            if self.wand_selection is not None and (self.wand_mode or self.mask_edit_mode or self.active_tool == "color_range"):
+            if self.active_tool == "wand_cleanup" and self.wand_cleanup_points:
+                self.delete_wand_cleanup_point()
+            elif self.wand_selection is not None and (self.wand_mode or self.mask_edit_mode or self.active_tool == "color_range"):
                 self.apply_wand_selection_to_alpha(0)
             else:
                 self.delete_current_frame()
         elif self.hotkey_matches(event, "selection_apply"):
-            if self.wand_selection is not None and (self.wand_mode or self.mask_edit_mode or self.active_tool == "color_range"):
+            if self.active_tool == "wand_cleanup":
+                self.apply_current_wand_cleanup_settings()
+            elif self.wand_selection is not None and (self.wand_mode or self.mask_edit_mode or self.active_tool == "color_range"):
                 self.apply_wand_selection_to_alpha(255)
         elif self.hotkey_matches(event, "selection_restore"):
             if self.wand_selection is not None and (self.wand_mode or self.mask_edit_mode or self.active_tool == "color_range"):
@@ -7565,8 +8251,39 @@ class FrameEditorApp:
                 pygame.draw.circle(self.screen, color, mouse, radius, 2)
                 pygame.draw.circle(self.screen, (255, 255, 255), mouse, max(1, radius // 6), 1)
 
+        if self.active_tool == "wand_cleanup" and self.wand_cleanup_points:
+            self.draw_wand_cleanup_points(rect)
+
         if self.wand_selection is not None and (self.wand_mode or self.mask_edit_mode or self.active_tool == "color_range"):
             self.draw_wand_selection_overlay(rect)
+
+    def draw_wand_cleanup_points(self, rect):
+        if not self.frames:
+            return
+        full = self.load_full_surface(self.current_index)
+        img_w, img_h = full.get_size()
+        fit_scale = min(rect.w / img_w, rect.h / img_h)
+        scale = max(0.05, fit_scale * self.preview_zoom)
+        draw_w = max(1, int(img_w * scale))
+        draw_h = max(1, int(img_h * scale))
+        draw_x = rect.x + (rect.w - draw_w) // 2 + int(self.preview_offset[0])
+        draw_y = rect.y + (rect.h - draw_h) // 2 + int(self.preview_offset[1])
+        mouse = pygame.mouse.get_pos()
+
+        for number, (x, y) in enumerate(self.wand_cleanup_points, start=1):
+            screen_x = draw_x + int(x * scale)
+            screen_y = draw_y + int(y * scale)
+            if not rect.collidepoint((screen_x, screen_y)):
+                continue
+            hover = (screen_x - mouse[0]) * (screen_x - mouse[0]) + (screen_y - mouse[1]) * (screen_y - mouse[1]) <= 12 * 12
+            if self.wand_cleanup_show_points or hover:
+                pygame.draw.circle(self.screen, (255, 210, 60), (screen_x, screen_y), 8)
+                pygame.draw.circle(self.screen, (0, 0, 0), (screen_x, screen_y), 8, 2)
+                label = self.small_font.render(str(number), True, (0, 0, 0))
+                self.screen.blit(label, label.get_rect(center=(screen_x, screen_y)))
+            else:
+                pygame.draw.circle(self.screen, (255, 210, 60), (screen_x, screen_y), 2)
+                pygame.draw.circle(self.screen, (0, 0, 0), (screen_x, screen_y), 2, 1)
 
     def draw_wand_selection_overlay(self, rect):
         if self.wand_selection is None or not self.frames:
@@ -7683,6 +8400,10 @@ class FrameEditorApp:
                         self.screen = pygame.display.set_mode(event.size, pygame.RESIZABLE)
                         self.clamp_preview_offset()
                         self.needs_preview_refresh = True
+                    elif event.type == getattr(pygame, "WINDOWFOCUSGAINED", -1):
+                        self.handle_window_focus_gained()
+                    elif event.type == getattr(pygame, "ACTIVEEVENT", -1) and getattr(event, "gain", 0):
+                        self.handle_window_focus_gained()
                     elif event.type == pygame.MOUSEBUTTONDOWN:
                         self.handle_mouse_button_down(event)
                     elif event.type == pygame.MOUSEBUTTONUP:
@@ -7699,6 +8420,7 @@ class FrameEditorApp:
                     self.handle_filesystem_exception(exc)
 
             try:
+                self.replay_focus_click_if_needed()
                 self.tk_root.update_idletasks()
                 self.tk_root.update()
             except Exception:
