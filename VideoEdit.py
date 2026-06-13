@@ -9,13 +9,20 @@ import gc
 import time
 import threading
 import re
+import configparser
 from pathlib import Path
 
 import pygame
 from PIL import Image, ImageEnhance, ImageGrab, ImageTk
 from tkinter import Tk, Toplevel, Label, Entry, Button, Frame, StringVar, Scale, HORIZONTAL, OptionMenu, Text, filedialog, messagebox
 
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
 TEMP_DIR = Path("temp_frames")
+CONFIG_PATH = Path("VideoEdit.ini")
 LOG_PATH = Path("VideoEdit.log")
 APPEND_TEMP_DIR = TEMP_DIR / "_append_video"
 EXPORT_TEMP_DIR = TEMP_DIR / "_export_frames"
@@ -51,6 +58,9 @@ MAX_DISK_LOAD_BATCH_SIZE = 160
 MAX_MEMORY_LOAD_BATCH_SIZE = 100
 MAX_PARALLEL_FFMPEG_PRELOADS = 12
 DISK_PRELOAD_WORKER_CHUNK_SIZE = 24
+VIDEO_PLAYER_BUFFER_BEHIND_FRAMES = 6
+VIDEO_PLAYER_BUFFER_SECONDS_AHEAD = 2.0
+VIDEO_PLAYER_JUMP_RESET_FRAMES = DISK_PRELOAD_WORKER_CHUNK_SIZE
 FULL_CACHE_RADIUS = MEMORY_PRELOAD_AFTER
 VIDEO_FRAME_BUFFER_LIMIT = 500
 ENABLE_FRAME_SWITCH_PROFILING = False
@@ -75,7 +85,70 @@ RIFE_DOWNLOAD_URL = "https://github.com/nihui/rife-ncnn-vulkan/releases"
 RIFE_INPUT_DIR = TEMP_DIR / "_rife_input"
 RIFE_OUTPUT_DIR = TEMP_DIR / "_rife_output"
 USE_FFMPEG_RAW_PIPE_PRELOAD = True
+USE_OPENCV_VIDEO_DECODER = True
 LOG_LOCK = threading.Lock()
+
+DEFAULT_HOTKEYS = {
+    "open_video": "O",
+    "reload_source": "Ctrl+R",
+    "retarget": "R",
+    "preview_animation": "P",
+    "export_video": "S",
+    "copy_frame": "C",
+    "paste_frame": "V",
+    "delete_frame_or_mask": "Delete",
+    "jump_to_frame": "J",
+    "first_frame": "Home",
+    "last_frame": "End",
+    "reset_preview": "0",
+    "color_tools": "H",
+    "mask_edit": "M",
+    "wand_select": "W",
+    "selection_grow": "Up",
+    "selection_shrink": "Down",
+    "selection_apply": "Return",
+    "selection_restore": "Insert",
+    "escape": "Escape",
+}
+
+HOTKEY_LABELS = {
+    "open_video": "Open Video",
+    "reload_source": "Reload Source",
+    "retarget": "Retarget Size/FPS",
+    "preview_animation": "Preview Animation",
+    "export_video": "Export Video",
+    "copy_frame": "Copy Current Frame",
+    "paste_frame": "Paste Over Current Frame",
+    "delete_frame_or_mask": "Delete Frame / Remove Mask",
+    "jump_to_frame": "Jump To Frame",
+    "first_frame": "First Frame",
+    "last_frame": "Last Frame",
+    "reset_preview": "Reset Preview",
+    "color_tools": "Color Tools",
+    "mask_edit": "Mask Edit",
+    "wand_select": "Wand Select",
+    "selection_grow": "Grow Selection",
+    "selection_shrink": "Shrink Selection",
+    "selection_apply": "Apply Selection",
+    "selection_restore": "Restore Selection",
+    "escape": "Escape / Close",
+}
+
+HOTKEY_ORDER = list(DEFAULT_HOTKEYS.keys())
+
+TK_SHIFT_MASK = 0x0001
+TK_CONTROL_MASK = 0x0004
+TK_ALT_MASK = 0x20000 if sys.platform.startswith("win") else 0x0008
+
+KEY_NAME_ALIASES = {
+    "DEL": "DELETE",
+    "ESC": "ESCAPE",
+    "RETURN": "RETURN",
+    "ENTER": "RETURN",
+    "INS": "INSERT",
+    "PGUP": "PAGEUP",
+    "PGDN": "PAGEDOWN",
+}
 
 
 def append_log(message):
@@ -506,12 +579,19 @@ class FrameEditorApp:
         self.disk_preload_lock = threading.Lock()
         self.disk_preload_inflight = set()
         self.disk_preload_active_workers = 0
+        self.video_decoder_lock = threading.Lock()
+        self.video_decoder_running = False
+        self.video_decoder_generation = 0
+        self.video_decoder_start = None
+        self.video_decoder_end = None
+        self.video_decoder_direction = 0
         self.loader_disk_batch_size = MIN_DISK_LOAD_BATCH_SIZE
         self.loader_memory_batch_size = MIN_MEMORY_LOAD_BATCH_SIZE
         self.loader_disk_fps_estimate = 0.0
         self.loader_memory_fps_estimate = 0.0
         self.loader_next_log_time = 0.0
         self.parallel_next_log_time = 0.0
+        self.memory_use_next_log_time = 0.0
         self.loop_next_log_time = time.perf_counter() + 1.0
         self.loop_frame_count = 0
         self.loop_last_log_time = time.perf_counter()
@@ -520,6 +600,8 @@ class FrameEditorApp:
         self.frames = []
         self.frame_paths = []
         self.current_index = 0
+        self.hotkeys = dict(DEFAULT_HOTKEYS)
+        self.hotkey_popup = None
         self.target_frame = 0
         self.preview_target_frame = 0
         self.target_direction = 0
@@ -603,6 +685,7 @@ class FrameEditorApp:
         self.mask_paint_mode = "restore"
         self.mask_brush_size = 12
         self.mask_dragging = False
+        self.mask_drag_combine_mode = "add"
         self.wand_mode = False
         self.wand_selection = None
         self.wand_tolerance = 32
@@ -635,7 +718,130 @@ class FrameEditorApp:
 
         self.tk_root = Tk()
         self.tk_root.withdraw()
+        self.load_hotkeys()
         self.check_ffmpeg_on_startup()
+
+    # ---------- hotkeys ----------
+    def load_hotkeys(self):
+        self.hotkeys = dict(DEFAULT_HOTKEYS)
+        config = configparser.ConfigParser()
+        try:
+            config.read(CONFIG_PATH, encoding="utf-8")
+            if config.has_section("Hotkeys"):
+                for action in HOTKEY_ORDER:
+                    value = config.get("Hotkeys", action, fallback=self.hotkeys[action]).strip()
+                    if value:
+                        self.hotkeys[action] = value
+        except Exception:
+            self.hotkeys = dict(DEFAULT_HOTKEYS)
+
+    def save_hotkeys(self):
+        config = configparser.ConfigParser()
+        config["Hotkeys"] = {action: self.hotkeys.get(action, DEFAULT_HOTKEYS[action]) for action in HOTKEY_ORDER}
+        with CONFIG_PATH.open("w", encoding="utf-8") as file:
+            config.write(file)
+
+    def hotkey_label(self, action):
+        return self.hotkeys.get(action, DEFAULT_HOTKEYS.get(action, ""))
+
+    def key_name_for_event(self, event):
+        name = pygame.key.name(event.key).upper()
+        if len(name) == 1:
+            return name
+        name = name.replace(" ", "")
+        aliases = {
+            "RETURN": "Return",
+            "ESCAPE": "Escape",
+            "DELETE": "Delete",
+            "BACKSPACE": "Backspace",
+            "INSERT": "Insert",
+            "HOME": "Home",
+            "END": "End",
+            "UP": "Up",
+            "DOWN": "Down",
+            "LEFT": "Left",
+            "RIGHT": "Right",
+            "PAGEUP": "PageUp",
+            "PAGEDOWN": "PageDown",
+            "SPACE": "Space",
+        }
+        return aliases.get(name, name.title())
+
+    def hotkey_from_event(self, event):
+        parts = []
+        if event.mod & (pygame.KMOD_CTRL | pygame.KMOD_META):
+            parts.append("Ctrl")
+        if event.mod & pygame.KMOD_ALT:
+            parts.append("Alt")
+        if event.mod & pygame.KMOD_SHIFT:
+            parts.append("Shift")
+        parts.append(self.key_name_for_event(event))
+        return "+".join(parts)
+
+    def hotkey_from_tk_event(self, event):
+        parts = []
+        state = getattr(event, "state", 0)
+        if state & TK_CONTROL_MASK:
+            parts.append("Ctrl")
+        if state & TK_ALT_MASK:
+            parts.append("Alt")
+        if state & TK_SHIFT_MASK:
+            parts.append("Shift")
+        key = getattr(event, "keysym", "") or getattr(event, "char", "")
+        if key in ("Control_L", "Control_R", "Shift_L", "Shift_R", "Alt_L", "Alt_R"):
+            return None
+        aliases = {
+            "Escape": "Escape",
+            "Return": "Return",
+            "KP_Enter": "Return",
+            "Delete": "Delete",
+            "Insert": "Insert",
+            "Home": "Home",
+            "End": "End",
+            "Up": "Up",
+            "Down": "Down",
+            "Left": "Left",
+            "Right": "Right",
+            "space": "Space",
+        }
+        key_name = aliases.get(key, key.upper() if len(key) == 1 else key)
+        parts.append(key_name)
+        return self.normalize_hotkey("+".join(parts))
+
+    def normalize_hotkey(self, hotkey):
+        parts = [part.strip() for part in str(hotkey).split("+") if part.strip()]
+        normalized = []
+        for part in parts:
+            upper = KEY_NAME_ALIASES.get(part.upper(), part.upper())
+            if upper in ("CTRL", "CONTROL", "CMD", "META"):
+                normalized.append("Ctrl")
+            elif upper == "ALT":
+                normalized.append("Alt")
+            elif upper == "SHIFT":
+                normalized.append("Shift")
+            elif len(upper) == 1:
+                normalized.append(upper)
+            else:
+                normalized.append({
+                    "DELETE": "Delete",
+                    "RETURN": "Return",
+                    "ESCAPE": "Escape",
+                    "INSERT": "Insert",
+                    "HOME": "Home",
+                    "END": "End",
+                    "UP": "Up",
+                    "DOWN": "Down",
+                    "LEFT": "Left",
+                    "RIGHT": "Right",
+                    "PAGEUP": "PageUp",
+                    "PAGEDOWN": "PageDown",
+                    "SPACE": "Space",
+                }.get(upper, upper.title()))
+        return "+".join(normalized)
+
+    def hotkey_matches(self, event, action):
+        configured = self.normalize_hotkey(self.hotkey_label(action))
+        return configured and configured == self.normalize_hotkey(self.hotkey_from_event(event))
 
     # ---------- tool modes ----------
     def clear_active_tool(self, tool_name):
@@ -762,6 +968,7 @@ class FrameEditorApp:
         if previous == "mask":
             self.mask_edit_mode = False
             self.mask_dragging = False
+            self.mask_drag_combine_mode = "add"
             self.close_selection_tools()
         elif previous == "wand":
             self.wand_mode = False
@@ -794,6 +1001,7 @@ class FrameEditorApp:
         self.mask_edit_mode = False
         self.mask_paint_mode = "restore"
         self.mask_dragging = False
+        self.mask_drag_combine_mode = "add"
         self.mask_brush_size = 12
         self.wand_mode = False
         self.wand_selection = None
@@ -1326,12 +1534,20 @@ class FrameEditorApp:
         return min(MEMORY_PRELOAD_BEFORE + MEMORY_PRELOAD_AFTER, max(1, lead))
 
     def urgent_directional_indexes(self, target, direction):
-        count = max(1, min(DISK_PRELOAD_WORKER_CHUNK_SIZE, int(round(self.get_loader_target_fps()))))
+        ahead = max(DISK_PRELOAD_WORKER_CHUNK_SIZE, int(round(self.get_loader_target_fps())))
+        ahead = min(MAX_DISK_LOAD_BATCH_SIZE, ahead)
+        behind = min(VIDEO_PLAYER_BUFFER_BEHIND_FRAMES, max(0, ahead // 2))
         if direction > 0:
-            return list(range(target, min(len(self.frame_paths), target + count)))
+            start = max(0, target - behind)
+            end = min(len(self.frame_paths), target + ahead + 1)
+            return list(range(start, end))
         if direction < 0:
-            return list(range(target, max(-1, target - count), -1))
-        return self.prioritized_frame_indexes_for_target(target, count // 2, count - (count // 2) - 1)
+            start = max(0, target - ahead)
+            end = min(len(self.frame_paths), target + behind + 1)
+            return list(range(end - 1, start - 1, -1))
+        before = min(ahead // 2, MEMORY_PRELOAD_BEFORE)
+        after = min(ahead - before, MEMORY_PRELOAD_AFTER)
+        return self.prioritized_frame_indexes_for_target(target, before, after)
 
     def tune_loader_batch_size(self, current_size, frame_count, elapsed, minimum):
         if frame_count <= 0 or elapsed <= 0:
@@ -1372,6 +1588,11 @@ class FrameEditorApp:
         with self.disk_preload_lock:
             self.disk_preload_inflight.clear()
             self.disk_preload_active_workers = 0
+        with self.video_decoder_lock:
+            self.video_decoder_generation += 1
+            self.video_decoder_running = False
+            self.video_decoder_start = None
+            self.video_decoder_end = None
         with self.cache_lock:
             self.memory_decode_queue.clear()
             self.memory_decode_queued.clear()
@@ -1422,6 +1643,101 @@ class FrameEditorApp:
         if killed:
             append_log(f"ffmpeg_kill_stale count={killed}")
 
+    def use_opencv_video_decoder(self):
+        return USE_OPENCV_VIDEO_DECODER and cv2 is not None and self.frame_source_type == "video" and self.video_path is not None
+
+    def video_decoder_window_for_target(self, target, direction):
+        target = max(0, min(len(self.frame_paths) - 1, int(target)))
+        ahead = max(DISK_PRELOAD_WORKER_CHUNK_SIZE, int(round(self.get_loader_target_fps() * VIDEO_PLAYER_BUFFER_SECONDS_AHEAD)))
+        behind = VIDEO_PLAYER_BUFFER_BEHIND_FRAMES
+        if direction > 0:
+            start = max(0, target - behind)
+            end = min(len(self.frame_paths) - 1, target + ahead)
+        elif direction < 0:
+            start = max(0, target - ahead)
+            end = min(len(self.frame_paths) - 1, target + behind)
+        else:
+            before = min(MEMORY_PRELOAD_BEFORE, ahead // 2)
+            after = min(MEMORY_PRELOAD_AFTER, ahead - before)
+            start = max(0, target - before)
+            end = min(len(self.frame_paths) - 1, target + after)
+        return start, end
+
+    def ensure_video_decoder_window(self, target, direction):
+        if not self.use_opencv_video_decoder() or not self.frames:
+            return False
+        start, end = self.video_decoder_window_for_target(target, direction)
+        with self.video_decoder_lock:
+            if self.video_decoder_running and self.video_decoder_start is not None:
+                if direction != self.video_decoder_direction:
+                    self.video_decoder_generation += 1
+                    self.video_decoder_running = False
+                elif direction >= 0 and self.video_decoder_direction >= 0 and self.video_decoder_start <= target <= self.video_decoder_end + DISK_PRELOAD_WORKER_CHUNK_SIZE:
+                    self.video_decoder_end = max(self.video_decoder_end, end)
+                    self.video_decoder_direction = direction
+                    return True
+                elif self.video_decoder_start <= target <= self.video_decoder_end and start >= self.video_decoder_start and end <= self.video_decoder_end:
+                    return True
+            self.video_decoder_generation += 1
+            generation = self.video_decoder_generation
+            self.video_decoder_start = start
+            self.video_decoder_end = end
+            self.video_decoder_direction = direction
+            self.video_decoder_running = True
+        threading.Thread(target=self.video_decoder_worker, args=(generation, start), daemon=True).start()
+        append_log(f"decoder_window start={start} end={end} dir={direction}")
+        return True
+
+    def video_decoder_worker(self, generation, start):
+        cap = None
+        try:
+            cap = cv2.VideoCapture(str(self.video_path))
+            if not cap.isOpened():
+                append_log("decoder_error open_failed")
+                return
+            current_source = self.source_frame_indexes[start] if start < len(self.source_frame_indexes) else start
+            cap.set(cv2.CAP_PROP_POS_FRAMES, float(current_source))
+            index = start
+            idle_since = None
+            while True:
+                with self.video_decoder_lock:
+                    if generation != self.video_decoder_generation:
+                        return
+                    end = self.video_decoder_end
+                if index > end:
+                    if idle_since is None:
+                        idle_since = time.perf_counter()
+                    if time.perf_counter() - idle_since > 0.25:
+                        return
+                    time.sleep(0.005)
+                    continue
+                idle_since = None
+                expected_source = self.source_frame_indexes[index] if index < len(self.source_frame_indexes) else index
+                if expected_source < current_source:
+                    return
+                while current_source < expected_source:
+                    ok, _frame = cap.read()
+                    if not ok:
+                        return
+                    current_source += 1
+                ok, frame = cap.read()
+                if not ok:
+                    return
+                current_source += 1
+                if 0 <= index < len(self.frame_paths) and index not in self.edited_frame_indexes and self.should_keep_source_decode_frame(index):
+                    rgba = cv2.cvtColor(frame, cv2.COLOR_BGR2RGBA)
+                    image = Image.fromarray(rgba, "RGBA")
+                    self.cache_pil_frame(index, image, queue_pygame=True)
+                index += 1
+        except Exception as exc:
+            append_log(f"decoder_error {type(exc).__name__}")
+        finally:
+            if cap is not None:
+                cap.release()
+            with self.video_decoder_lock:
+                if generation == self.video_decoder_generation:
+                    self.video_decoder_running = False
+
     def ensure_preload_coordinator(self):
         if not hasattr(self, "preload_coordinator_running"):
             return
@@ -1453,6 +1769,10 @@ class FrameEditorApp:
             if not self.dragging_timeline and abs(self.scroll_velocity) <= 0.01:
                 preview_direction = 0
             cancel_on_target_change = not (self.left_held or self.right_held)
+            if self.ensure_video_decoder_window(target, target_direction):
+                self.cancel_stale_preload_processes()
+                time.sleep(0.01)
+                continue
             self.cancel_stale_preload_processes()
 
             priority = self.preload_priority_indexes(
@@ -2101,7 +2421,8 @@ class FrameEditorApp:
                 if not keep_decode:
                     loaded += 1
                     continue
-                self.cache_pil_frame(index, image, queue_pygame=True)
+                if index not in self.edited_frame_indexes:
+                    self.cache_pil_frame(index, image, queue_pygame=True)
                 loaded += 1
 
             return_code = process.wait(timeout=2)
@@ -2168,6 +2489,9 @@ class FrameEditorApp:
         if not still_current:
             self.unlink_path_quiet(preload_path)
             return False
+        if index in self.edited_frame_indexes:
+            self.unlink_path_quiet(preload_path)
+            return False
 
         path = self.frame_temp_path(index)
         if self.has_disk_frame_index(index):
@@ -2187,6 +2511,12 @@ class FrameEditorApp:
         index = self.frame_index_from_temp_path(path)
         if index is None:
             return path, False
+
+        if index in self.edited_frame_indexes:
+            if path.exists():
+                self.mark_disk_frame_index(index)
+                return path, False
+            return None, False
 
         if self.has_disk_frame_index(index):
             if self.frame_source_type == "video" and index not in self.edited_frame_indexes:
@@ -2392,7 +2722,7 @@ class FrameEditorApp:
             self.draw_active_menu()
         pygame.display.flip()
 
-    def open_video_path(self, path):
+    def open_video_path(self, path, restore_state=None):
         path = Path(path)
         if not path.exists():
             self.set_status("File not found")
@@ -2429,13 +2759,15 @@ class FrameEditorApp:
         self.source_frame_paths = []
         self.edited_frame_indexes = set()
         self.set_virtual_frame_list(frame_count)
-        self.current_index = 0
+        restore_state = restore_state or {}
+        restore_index = int(restore_state.get("current_index", 0))
+        self.current_index = max(0, min(restore_index, frame_count - 1))
         self.set_loader_targets(self.current_index)
         self.initialize_retarget_settings()
-        self.scroll_x = 0.0
+        self.scroll_x = float(restore_state.get("scroll_x", 0.0))
         self.scroll_velocity = 0.0
-        self.preview_zoom = 1.0
-        self.preview_offset = [0.0, 0.0]
+        self.preview_zoom = float(restore_state.get("preview_zoom", 1.0))
+        self.preview_offset = list(restore_state.get("preview_offset", [0.0, 0.0]))
 
         self.full_cache.clear()
         self.thumb_cache.clear()
@@ -2453,10 +2785,14 @@ class FrameEditorApp:
         self.promote_pil_frame_to_pygame(self.current_index)
         self.prime_caches_near_current()
         self.rebuild_timeline_metrics()
-        self.center_selected()
+        if restore_state:
+            self.clamp_scroll()
+        else:
+            self.center_selected()
         self.schedule_wand_zone_preload()
         self.loading_message = ""
-        self.set_status(f"Opened {path.name} lazily ({frame_count} frames)", 5000)
+        verb = "Reloaded" if restore_state else "Opened"
+        self.set_status(f"{verb} {path.name} lazily ({frame_count} frames)", 5000)
 
     def open_video(self):
         self.loading_message = "Opening video..."
@@ -2611,7 +2947,13 @@ class FrameEditorApp:
         if self.video_path is None:
             self.set_status("No source video to reload")
             return
-        self.open_video_path(self.video_path)
+        restore_state = {
+            "current_index": self.current_index,
+            "scroll_x": self.scroll_x,
+            "preview_zoom": self.preview_zoom,
+            "preview_offset": list(self.preview_offset),
+        }
+        self.open_video_path(self.video_path, restore_state=restore_state)
 
     def can_reload_current_frame_from_source(self):
         if not self.frames:
@@ -3792,11 +4134,9 @@ class FrameEditorApp:
 
     # ---------- cache ----------
     def load_surface_uncached(self, index, allow_async=False):
-        if allow_async:
-            surf = self.full_cache.get(index)
-            if surf is not None:
-                return surf, True
-            return self.make_black_frame_surface(), False
+        surf = self.full_cache.get(index)
+        if surf is not None:
+            return surf, True
 
         cached = self.get_cached_pil_frame(index, "RGBA")
         if cached is not None:
@@ -3821,12 +4161,24 @@ class FrameEditorApp:
     def load_full_surface(self, index):
         surf = self.full_cache.get(index)
         if surf is not None:
+            self.log_memory_frame_use(index, "pygame")
             return surf
         surf, loaded = self.load_surface_uncached(index, allow_async=True)
         if loaded:
             self.full_cache[index] = surf
+            self.log_memory_frame_use(index, "loaded")
             self.prune_full_cache()
         return surf
+
+    def log_memory_frame_use(self, index, source):
+        now = time.perf_counter()
+        if now < self.memory_use_next_log_time:
+            return
+        self.memory_use_next_log_time = now + 0.5
+        edited = index in self.edited_frame_indexes
+        with self.cache_lock:
+            pil_ready = index in self.pil_cache
+        append_log(f"memory_use index={index} source={source} edited={int(edited)} pil={int(pil_ready)} pygame={int(index in self.full_cache)}")
 
     def prune_full_cache(self):
         keep = set(self.centered_frame_indexes(MEMORY_PRELOAD_BEFORE, MEMORY_PRELOAD_AFTER))
@@ -4040,7 +4392,7 @@ class FrameEditorApp:
             profile_last = now
 
         old_index = self.current_index
-        if abs(index - old_index) > DISK_PRELOAD_AFTER:
+        if abs(index - old_index) > VIDEO_PLAYER_JUMP_RESET_FRAMES:
             self.clear_preload_queue()
         self.current_index = index
         self.set_loader_targets(index)
@@ -4120,6 +4472,7 @@ class FrameEditorApp:
 
         if self.jump_popup is not None and self.jump_popup.winfo_exists():
             self.jump_popup.lift()
+            self.jump_popup.focus_force()
             return
 
         popup = Toplevel(self.tk_root)
@@ -4136,6 +4489,11 @@ class FrameEditorApp:
         entry = Entry(main, textvariable=value_var, width=24)
         entry.grid(row=1, column=0, columnspan=2, sticky="ew")
         Label(main, textvariable=error_var, fg="red").grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        def focus_entry():
+            entry.focus_force()
+            entry.selection_range(0, "end")
+            entry.icursor("end")
 
         buttons = Frame(main)
         buttons.grid(row=3, column=0, columnspan=2, sticky="e", pady=(12, 0))
@@ -4164,8 +4522,7 @@ class FrameEditorApp:
         popup.protocol("WM_DELETE_WINDOW", close_popup)
         popup.bind("<Return>", lambda _event: apply_jump())
         popup.bind("<Escape>", lambda _event: close_popup())
-        entry.focus_set()
-        entry.selection_range(0, "end")
+        popup.after_idle(focus_entry)
 
     def refresh_preview_surface(self):
         if not self.frames:
@@ -4293,6 +4650,8 @@ class FrameEditorApp:
                 return cached
 
         read_path, transient = self.resolve_frame_read_path(path)
+        if read_path is None:
+            return None
 
         def operation():
             with Image.open(read_path) as image:
@@ -5184,6 +5543,7 @@ class FrameEditorApp:
         if self.mask_edit_mode:
             self.mask_edit_mode = False
             self.mask_dragging = False
+            self.mask_drag_combine_mode = "add"
             self.clear_active_tool("mask")
             self.close_selection_tools()
             self.set_status("Mask edit off")
@@ -5192,6 +5552,7 @@ class FrameEditorApp:
         self.set_active_tool("mask")
         self.mask_edit_mode = True
         self.mask_dragging = False
+        self.mask_drag_combine_mode = "add"
         self.update_selection_tools_visibility()
         self.set_status("Mask edit on")
 
@@ -5439,6 +5800,15 @@ class FrameEditorApp:
         if combine_mode is None:
             combine_mode = "add" if self.mask_paint_mode == "restore" else "subtract"
         self.brush_selection_at(mouse, combine_mode)
+
+    def mask_brush_combine_mode_from_mods(self, mods, button=1):
+        if mods & pygame.KMOD_SHIFT:
+            return "add"
+        if mods & (pygame.KMOD_CTRL | pygame.KMOD_META):
+            return "subtract"
+        if button == 3:
+            return "subtract"
+        return "replace"
 
     def get_wand_zone_cache(self, index):
         with self.wand_zone_lock:
@@ -6566,6 +6936,7 @@ class FrameEditorApp:
 
         delete_index = self.current_index
         delete_path = self.frame_paths[delete_index]
+        self.clear_preload_queue()
         self.wait_for_pending_frame_saves()
         self.release_file_caches()
         self.unlink_path_retry(delete_path, show_error=False)
@@ -6619,40 +6990,110 @@ class FrameEditorApp:
 
     def get_file_menu_items(self):
         return [
-            ("Open Video...", "O", self.open_video, True),
+            ("Open Video...", self.hotkey_label("open_video"), self.open_video, True),
             ("Open Image Folder...", "", self.open_image_folder, True),
             ("Append Video...", "", self.append_video_frames, bool(self.frames)),
-            ("Reload Source", "Ctrl+R", self.reload_video, self.video_path is not None),
-            ("Retarget Size/FPS...", "R", self.retarget_size_fps, bool(self.frames)),
-            ("Preview Animation", "P", self.show_animation_preview, bool(self.frames)),
-            ("Export Video...", "S", self.export_video, bool(self.frames)),
+            ("Reload Source", self.hotkey_label("reload_source"), self.reload_video, self.video_path is not None),
+            ("Settings...", "", self.open_settings, True),
+            ("Retarget Size/FPS...", self.hotkey_label("retarget"), self.retarget_size_fps, bool(self.frames)),
+            ("Preview Animation", self.hotkey_label("preview_animation"), self.show_animation_preview, bool(self.frames)),
+            ("Export Video...", self.hotkey_label("export_video"), self.export_video, bool(self.frames)),
             ("Export Frames To Folder...", "", self.export_frames_to_folder, bool(self.frames)),
             ("Export High Quality GIF...", "", self.export_high_quality_gif, bool(self.frames)),
             ("Exit", "", self.exit_app, True),
         ]
 
+    def open_settings(self):
+        if self.hotkey_popup is not None and self.hotkey_popup.winfo_exists():
+            self.hotkey_popup.lift()
+            return
+
+        popup = Toplevel(self.tk_root)
+        popup.title("Settings")
+        popup.resizable(False, False)
+        self.hotkey_popup = popup
+        active_capture = {"action": None}
+        vars_by_action = {}
+
+        main = Frame(popup, padx=14, pady=12)
+        main.pack()
+        Label(main, text="Click a hotkey box, then press the new key combo.").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        def begin_capture(action):
+            active_capture["action"] = action
+            vars_by_action[action].set("Press keys...")
+
+        def capture_key(event):
+            action = active_capture.get("action")
+            if action is None:
+                return
+            hotkey = self.hotkey_from_tk_event(event)
+            if not hotkey:
+                return "break"
+            vars_by_action[action].set(hotkey)
+            active_capture["action"] = None
+            return "break"
+
+        for row, action in enumerate(HOTKEY_ORDER, start=1):
+            Label(main, text=HOTKEY_LABELS.get(action, action)).grid(row=row, column=0, sticky="w", pady=2)
+            value = StringVar(value=self.hotkey_label(action))
+            vars_by_action[action] = value
+            entry = Entry(main, textvariable=value, width=18, state="readonly")
+            entry.grid(row=row, column=1, sticky="ew", padx=(12, 0), pady=2)
+            entry.bind("<Button-1>", lambda _event, item=action: begin_capture(item))
+            entry.bind("<FocusIn>", lambda _event, item=action: begin_capture(item))
+
+        buttons = Frame(main)
+        buttons.grid(row=len(HOTKEY_ORDER) + 1, column=0, columnspan=2, sticky="e", pady=(12, 0))
+
+        def reset_defaults():
+            for action in HOTKEY_ORDER:
+                vars_by_action[action].set(DEFAULT_HOTKEYS[action])
+
+        def save_and_close():
+            for action in HOTKEY_ORDER:
+                value = self.normalize_hotkey(vars_by_action[action].get())
+                self.hotkeys[action] = value or DEFAULT_HOTKEYS[action]
+            try:
+                self.save_hotkeys()
+                self.set_status("Settings saved")
+            except OSError:
+                self.set_status("Could not save settings")
+            close_popup()
+
+        def close_popup():
+            if self.hotkey_popup is popup:
+                self.hotkey_popup = None
+            popup.destroy()
+
+        Button(buttons, text="Defaults", command=reset_defaults).pack(side="left", padx=(0, 8))
+        Button(buttons, text="Save", command=save_and_close).pack(side="left", padx=(0, 8))
+        Button(buttons, text="Cancel", command=close_popup).pack(side="left")
+        popup.bind("<KeyPress>", capture_key)
+        popup.protocol("WM_DELETE_WINDOW", close_popup)
+
     def get_frame_menu_items(self):
         can_split_blend = bool(self.frames) and self.current_index >= 3 and (len(self.frames) - self.current_index - 1) >= 3
         can_loop_blend = len(self.frames) >= 8
         return [
-            ("Copy Current Frame", "C", self.copy_frame, bool(self.frames)),
-            ("Paste Over Current Frame", "V", self.paste_frame, bool(self.frames)),
+            ("Copy Current Frame", self.hotkey_label("copy_frame"), self.copy_frame, bool(self.frames)),
+            ("Paste Over Current Frame", self.hotkey_label("paste_frame"), self.paste_frame, bool(self.frames)),
             ("Append Frame After Current...", "", self.append_frame_after_current, bool(self.frames)),
             ("RIFE Double FPS...", "", self.open_rife_interpolation, bool(self.frames) and len(self.frames) <= RIFE_FRAME_LIMIT),
             ("RIFE Blend Selected Split", "", self.rife_blend_selected_split, can_split_blend),
             ("RIFE Blend Loop Seam", "", self.rife_blend_loop, can_loop_blend),
             ("Export Current Frame...", "", self.export_current_frame, bool(self.frames)),
-            ("Delete Current Frame", "Del", self.delete_current_frame, bool(self.frames)),
+            ("Delete Current Frame", self.hotkey_label("delete_frame_or_mask"), self.delete_current_frame, bool(self.frames)),
             ("Reload Frame From Source", "", self.reload_current_frame_from_source, self.can_reload_current_frame_from_source()),
-            ("Jump To Frame/Time...", "J", self.open_jump_to_frame, bool(self.frames)),
-            ("First Frame", "Home", lambda: self.set_current_index(0), bool(self.frames)),
-            ("Last Frame", "End", lambda: self.set_current_index(len(self.frames) - 1), bool(self.frames)),
-            ("Reset Preview", "0", self.reset_preview_view, bool(self.frames)),
+            ("Jump To Frame/Time...", self.hotkey_label("jump_to_frame"), self.open_jump_to_frame, bool(self.frames)),
+            ("First Frame", self.hotkey_label("first_frame"), lambda: self.set_current_index(0), bool(self.frames)),
+            ("Last Frame", self.hotkey_label("last_frame"), lambda: self.set_current_index(len(self.frames) - 1), bool(self.frames)),
+            ("Reset Preview", self.hotkey_label("reset_preview"), self.reset_preview_view, bool(self.frames)),
         ]
 
     def get_color_menu_items(self):
         return [
-            ("Color Tools...", "H", self.open_color_tools, bool(self.frames)),
+            ("Color Tools...", self.hotkey_label("color_tools"), self.open_color_tools, bool(self.frames)),
             ("Blend Selected With Adjacent", "", self.blend_selected_with_adjacent_frames, bool(self.frames)),
             ("Match Whole Video To Selected", "", self.match_video_to_selected_reference, bool(self.frames) and len(self.frames) <= LARGE_OPERATION_FRAME_LIMIT),
         ]
@@ -6661,8 +7102,8 @@ class FrameEditorApp:
         mode_label = "Mask Edit Off" if self.mask_edit_mode else "Mask Edit On"
         wand_label = "Wand Select Off" if self.wand_mode else "Wand Select On"
         return [
-            (mode_label, "M", self.toggle_mask_edit_mode, bool(self.frames)),
-            (wand_label, "W", self.toggle_wand_mode, bool(self.frames)),
+            (mode_label, self.hotkey_label("mask_edit"), self.toggle_mask_edit_mode, bool(self.frames)),
+            (wand_label, self.hotkey_label("wand_select"), self.toggle_wand_mode, bool(self.frames)),
             ("Remove By Color...", "", self.open_color_range_tools, bool(self.frames)),
             ("Selection Tools...", "", self.open_selection_tools, self.selection_is_visible()),
             ("Clear Wand Selection", "", self.clear_wand_selection, self.wand_selection is not None),
@@ -6774,10 +7215,11 @@ class FrameEditorApp:
                     self.update_wand_selection(image_pos, self.wand_combine_mode, self.wand_tolerance)
             elif self.mask_edit_mode and preview_rect.collidepoint(mouse):
                 self.mask_dragging = True
-                self.mask_paint_mode = "restore"
                 mods = pygame.key.get_mods()
-                combine_mode = "add" if mods & (pygame.KMOD_CTRL | pygame.KMOD_META) else "replace"
+                combine_mode = self.mask_brush_combine_mode_from_mods(mods, event.button)
+                self.mask_paint_mode = "erase" if combine_mode == "subtract" else "restore"
                 self.paint_mask_at(mouse, combine_mode)
+                self.mask_drag_combine_mode = "subtract" if combine_mode == "subtract" else "add"
             elif preview_rect.collidepoint(mouse):
                 self.dragging_preview = True
                 self.preview_drag_last = mouse
@@ -6795,8 +7237,11 @@ class FrameEditorApp:
                     self.color_range_image_sampler(image_pos, True)
             elif self.mask_edit_mode and preview_rect.collidepoint(mouse):
                 self.mask_dragging = True
-                self.mask_paint_mode = "erase"
-                self.paint_mask_at(mouse)
+                mods = pygame.key.get_mods()
+                combine_mode = self.mask_brush_combine_mode_from_mods(mods, event.button)
+                self.mask_paint_mode = "erase" if combine_mode == "subtract" else "restore"
+                self.paint_mask_at(mouse, combine_mode)
+                self.mask_drag_combine_mode = "subtract" if combine_mode == "subtract" else "add"
         elif event.button == 2:
             if preview_rect.collidepoint(mouse):
                 self.dragging_preview = True
@@ -6829,6 +7274,7 @@ class FrameEditorApp:
         self.dragging_timeline = False
         self.dragging_preview = False
         self.mask_dragging = False
+        self.mask_drag_combine_mode = "add"
         self.wand_dragging = False
         self.wand_drag_base = None
         self.click_candidate = False
@@ -6841,7 +7287,15 @@ class FrameEditorApp:
                 self.wand_last_drag_tolerance = self.wand_tolerance
                 self.update_wand_selection(self.wand_start_pos, self.wand_combine_mode, self.wand_tolerance)
         elif self.mask_dragging and self.mask_edit_mode:
-            self.paint_mask_at(event.pos)
+            mods = pygame.key.get_mods()
+            if mods & pygame.KMOD_SHIFT:
+                combine_mode = "add"
+            elif mods & (pygame.KMOD_CTRL | pygame.KMOD_META):
+                combine_mode = "subtract"
+            else:
+                combine_mode = self.mask_drag_combine_mode
+            self.mask_paint_mode = "erase" if combine_mode == "subtract" else "restore"
+            self.paint_mask_at(event.pos, combine_mode)
         elif self.dragging_timeline:
             dx = event.pos[0] - self.last_mouse_x
             self.scroll_x -= dx * DRAG_MULTIPLIER
@@ -6862,7 +7316,6 @@ class FrameEditorApp:
 
     def handle_keydown(self, event):
         now = pygame.time.get_ticks()
-        ctrl_held = bool(event.mod & (pygame.KMOD_CTRL | pygame.KMOD_META))
         if event.key == pygame.K_LEFT:
             self.left_held = True
             if self.frames:
@@ -6873,55 +7326,54 @@ class FrameEditorApp:
             if self.frames:
                 self.set_current_index(self.current_index + 1)
             self.right_next_repeat = now + self.get_frame_repeat_interval_ms()
-        elif event.key == pygame.K_UP:
+        elif self.hotkey_matches(event, "selection_grow"):
             if self.selection_is_visible():
                 self.grow_wand_selection(1)
-        elif event.key == pygame.K_DOWN:
+        elif self.hotkey_matches(event, "selection_shrink"):
             if self.selection_is_visible():
                 self.shrink_wand_selection(1)
-        elif event.key == pygame.K_HOME:
+        elif self.hotkey_matches(event, "first_frame"):
             if self.frames:
                 self.set_current_index(0)
-        elif event.key == pygame.K_END:
+        elif self.hotkey_matches(event, "last_frame"):
             if self.frames:
                 self.set_current_index(len(self.frames) - 1)
-        elif event.key == pygame.K_o:
+        elif self.hotkey_matches(event, "open_video"):
             self.open_video()
-        elif event.key == pygame.K_r:
-            if ctrl_held:
-                self.reload_video()
-            else:
-                self.retarget_size_fps()
-        elif event.key == pygame.K_p:
+        elif self.hotkey_matches(event, "reload_source"):
+            self.reload_video()
+        elif self.hotkey_matches(event, "retarget"):
+            self.retarget_size_fps()
+        elif self.hotkey_matches(event, "preview_animation"):
             self.show_animation_preview()
-        elif event.key == pygame.K_h:
+        elif self.hotkey_matches(event, "color_tools"):
             self.open_color_tools()
-        elif event.key == pygame.K_j:
+        elif self.hotkey_matches(event, "jump_to_frame"):
             self.open_jump_to_frame()
-        elif event.key == pygame.K_m:
+        elif self.hotkey_matches(event, "mask_edit"):
             self.toggle_mask_edit_mode()
-        elif event.key == pygame.K_w:
+        elif self.hotkey_matches(event, "wand_select"):
             self.toggle_wand_mode()
-        elif event.key == pygame.K_s:
+        elif self.hotkey_matches(event, "export_video"):
             self.export_video()
-        elif event.key == pygame.K_c:
+        elif self.hotkey_matches(event, "copy_frame"):
             self.copy_frame()
-        elif event.key == pygame.K_v:
+        elif self.hotkey_matches(event, "paste_frame"):
             self.paste_frame()
-        elif event.key == pygame.K_DELETE:
+        elif self.hotkey_matches(event, "delete_frame_or_mask"):
             if self.wand_selection is not None and (self.wand_mode or self.mask_edit_mode or self.active_tool == "color_range"):
                 self.apply_wand_selection_to_alpha(0)
             else:
                 self.delete_current_frame()
-        elif event.key == pygame.K_RETURN:
+        elif self.hotkey_matches(event, "selection_apply"):
             if self.wand_selection is not None and (self.wand_mode or self.mask_edit_mode or self.active_tool == "color_range"):
                 self.apply_wand_selection_to_alpha(255)
-        elif event.key == pygame.K_INSERT:
+        elif self.hotkey_matches(event, "selection_restore"):
             if self.wand_selection is not None and (self.wand_mode or self.mask_edit_mode or self.active_tool == "color_range"):
                 self.apply_wand_selection_to_alpha(255)
-        elif event.key == pygame.K_0:
+        elif self.hotkey_matches(event, "reset_preview"):
             self.reset_preview_view()
-        elif event.key == pygame.K_ESCAPE:
+        elif self.hotkey_matches(event, "escape"):
             if self.wand_selection is not None:
                 self.clear_wand_selection()
             else:
@@ -7215,7 +7667,9 @@ class FrameEditorApp:
             self.promote_pil_frame_to_pygame(self.current_index)
 
         scrubbing = self.left_held or self.right_held
-        if not scrubbing:
+        if scrubbing:
+            self.process_pending_pygame_cache(limit=2)
+        else:
             self.process_pending_pygame_cache(limit=max(3, self.get_background_chunk_size() // 8))
 
     def run(self):
