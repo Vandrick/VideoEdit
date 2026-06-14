@@ -581,6 +581,7 @@ class FrameEditorApp:
         self.frame_source_type = None
         self.source_frame_paths = []
         self.source_frame_indexes = []
+        self.audio_sources = []
         self.edited_frame_indexes = set()
         self.mask_frame_indexes = set()
         self.source_mask_frame_indexes = set()
@@ -1504,6 +1505,7 @@ class FrameEditorApp:
         self.frame_source_type = None
         self.source_frame_paths = []
         self.source_frame_indexes = []
+        self.audio_sources = []
         self.edited_frame_indexes = set()
         self.mask_frame_indexes = set()
         self.source_mask_frame_indexes = set()
@@ -3414,6 +3416,7 @@ class FrameEditorApp:
         self.frame_source_type = "images"
         self.source_frame_paths = source_paths
         self.source_frame_indexes = []
+        self.audio_sources = [None] * len(source_paths)
         self.edited_frame_indexes = set()
         self.mask_frame_indexes = set()
         self.source_mask_frame_indexes = mask_indexes
@@ -3493,6 +3496,7 @@ class FrameEditorApp:
             return
         self.source_frame_indexes = IdentitySourceIndexes(frame_count)
         self.source_frame_paths = []
+        self.audio_sources = [(str(self.video_path), index, index + 1, self.fps) for index in range(frame_count)]
         self.edited_frame_indexes = set()
         self.set_virtual_frame_list(frame_count)
         restore_state = restore_state or {}
@@ -3567,6 +3571,7 @@ class FrameEditorApp:
         self.frame_source_type = "images"
         self.source_frame_paths = [path]
         self.source_frame_indexes = []
+        self.audio_sources = [None]
         self.edited_frame_indexes = set()
         self.fps = DEFAULT_IMAGE_FPS
         self.reset_loader_batch_sizes()
@@ -3634,6 +3639,7 @@ class FrameEditorApp:
         self.frame_source_type = "images"
         self.source_frame_paths = image_paths
         self.source_frame_indexes = []
+        self.audio_sources = [None] * total
         self.edited_frame_indexes = set()
         self.fps = DEFAULT_IMAGE_FPS
         self.reset_loader_batch_sizes()
@@ -4034,11 +4040,6 @@ class FrameEditorApp:
             return False
         if len(self.source_frame_indexes) != len(self.frame_paths) or not self.source_frame_indexes:
             return False
-        if any(
-            source_index <= previous
-            for previous, source_index in zip(self.source_frame_indexes, self.source_frame_indexes[1:])
-        ):
-            return False
         width, height, output_fps = self.get_retarget_settings()
         source_size = self.get_current_frame_size()
         if source_size is None:
@@ -4332,7 +4333,51 @@ class FrameEditorApp:
         return ["-i", str(self.video_path)]
 
     def source_audio_ranges(self):
-        if self.video_path is None or self.frame_source_type != "video" or not self.source_frame_indexes:
+        if self.video_path is None or self.frame_source_type != "video":
+            return []
+        if self.audio_sources and len(self.audio_sources) == len(self.frame_paths):
+            ranges = []
+            current_path = None
+            current_fps = None
+            start = None
+            current_end = None
+            previous = None
+            for source in self.audio_sources:
+                if source is None:
+                    if current_path is not None:
+                        ranges.append((current_path, start, current_end, current_fps or self.fps))
+                    current_path = None
+                    current_fps = None
+                    start = None
+                    current_end = None
+                    previous = None
+                    continue
+                if len(source) >= 4:
+                    path, source_start, source_end, source_fps = source[:4]
+                    source_start = int(source_start)
+                    source_end = int(source_end)
+                    source_fps = float(source_fps or self.fps)
+                else:
+                    path, source_start = source
+                    source_start = int(source_start)
+                    source_end = source_start + 1
+                    source_fps = self.fps
+                if current_path == path and current_fps == source_fps and current_end == source_start:
+                    current_end = source_end
+                    previous = source_end - 1
+                    continue
+                if current_path is not None:
+                    ranges.append((current_path, start, current_end, current_fps or self.fps))
+                current_path = path
+                current_fps = source_fps
+                start = source_start
+                current_end = source_end
+                previous = source_end - 1
+            if current_path is not None:
+                ranges.append((current_path, start, current_end, current_fps or self.fps))
+            return ranges
+
+        if not self.source_frame_indexes:
             return []
         ranges = []
         start = int(self.source_frame_indexes[0])
@@ -4342,10 +4387,10 @@ class FrameEditorApp:
             if source_index == previous + 1:
                 previous = source_index
                 continue
-            ranges.append((start, previous + 1))
+            ranges.append((str(self.video_path), start, previous + 1, self.fps))
             start = source_index
             previous = source_index
-        ranges.append((start, previous + 1))
+        ranges.append((str(self.video_path), start, previous + 1, self.fps))
         return ranges
 
     def can_copy_original_audio_for_export(self):
@@ -4353,6 +4398,17 @@ class FrameEditorApp:
             return False
         if len(self.source_frame_indexes) != len(self.frame_paths):
             return False
+        if self.audio_sources:
+            expected_path = str(self.video_path)
+            if len(self.audio_sources) != len(self.frame_paths):
+                return False
+            for index, source in enumerate(self.audio_sources):
+                if len(source) >= 4:
+                    path, start_frame, end_frame, source_fps = source[:4]
+                    if path != expected_path or int(start_frame) != index or int(end_frame) != index + 1 or abs(float(source_fps) - self.fps) > 0.01:
+                        return False
+                elif source != (expected_path, index):
+                    return False
         if self.source_frame_indexes[0] != 0:
             return False
         for index, source_index in enumerate(self.source_frame_indexes):
@@ -4360,6 +4416,61 @@ class FrameEditorApp:
                 return False
         expected_last = self.detect_frame_count(self.video_path) - 1
         return expected_last < 0 or self.source_frame_indexes[-1] == expected_last
+
+    def detect_audio_codec(self, source_path=None):
+        source_path = source_path or self.video_path
+        if source_path is None:
+            return ""
+        try:
+            ffprobe = self.get_ffmpeg_tool("ffprobe")
+            if not ffprobe:
+                return ""
+            result = subprocess.run(
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "a:0",
+                    "-show_entries",
+                    "stream=codec_name",
+                    "-of",
+                    "default=nw=1:nk=1",
+                    str(source_path),
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return (result.stdout or "").strip().splitlines()[0].lower()
+        except Exception:
+            return ""
+
+    def can_fast_copy_audio_codec(self, codec):
+        return codec in {"aac", "mp3", "alac", "ac3", "eac3"}
+
+    def extract_audio_segment(self, ffmpeg, source_path, start_time, duration, segment_path, copy_audio):
+        codec_args = ["-c:a", "copy"] if copy_audio else ["-c:a", "aac"]
+        subprocess.run(
+            [
+                ffmpeg,
+                "-y",
+                "-ss",
+                f"{start_time:.6f}",
+                "-i",
+                str(source_path),
+                "-t",
+                f"{duration:.6f}",
+                "-vn",
+                "-map",
+                "0:a?",
+                *codec_args,
+                segment_path,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
 
     def build_timeline_audio(self, ffmpeg, output_path):
         ranges = self.source_audio_ranges()
@@ -4369,38 +4480,36 @@ class FrameEditorApp:
         if not self.clear_work_folder(audio_dir, "clear smart export audio"):
             return False
         segment_paths = []
+        audio_codec = self.detect_audio_codec()
+        prefer_copy_audio = False
+        append_log(
+            f"audio_build codec={audio_codec or 'unknown'} prefer_copy={int(prefer_copy_audio)} "
+            f"ranges={len(ranges)} reason=accurate_cut_audio"
+        )
         try:
-            for segment_number, (start_frame, end_frame) in enumerate(ranges, start=1):
-                start_time = start_frame / max(self.fps, 0.001)
-                duration = max(0.001, (end_frame - start_frame) / max(self.fps, 0.001))
+            for segment_number, (source_path, start_frame, end_frame, source_fps) in enumerate(ranges, start=1):
+                segment_fps = max(float(source_fps or self.fps), 0.001)
+                start_time = start_frame / segment_fps
+                duration = max(0.001, (end_frame - start_frame) / segment_fps)
                 segment_path = audio_dir / f"audio_{segment_number:04d}.m4a"
-                self.set_export_progress(f"Audio: building segment {segment_number}/{len(ranges)}")
+                copy_audio = prefer_copy_audio
+                self.set_export_progress(
+                    f"Audio: {'copying' if copy_audio else 'rebuilding'} segment {segment_number}/{len(ranges)}"
+                )
                 append_log(
                     f"audio_segment number={segment_number} "
+                    f"source_path={source_path} "
                     f"source_start={start_frame} source_end={end_frame} "
-                    f"start_time={start_time:.6f} duration={duration:.6f}"
+                    f"start_time={start_time:.6f} duration={duration:.6f} copy={int(copy_audio)}"
                 )
-                subprocess.run(
-                    [
-                        ffmpeg,
-                        "-y",
-                        "-ss",
-                        f"{start_time:.6f}",
-                        "-i",
-                        str(self.video_path),
-                        "-t",
-                        f"{duration:.6f}",
-                        "-vn",
-                        "-map",
-                        "0:a?",
-                        "-c:a",
-                        "aac",
-                        segment_path,
-                    ],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=True,
-                )
+                try:
+                    self.extract_audio_segment(ffmpeg, source_path, start_time, duration, segment_path, copy_audio)
+                except (OSError, subprocess.CalledProcessError):
+                    if not copy_audio:
+                        raise
+                    append_log(f"audio_segment_copy_failed number={segment_number}; fallback=aac")
+                    self.set_export_progress(f"Audio: rebuilding segment {segment_number}/{len(ranges)}")
+                    self.extract_audio_segment(ffmpeg, source_path, start_time, duration, segment_path, False)
                 if segment_path.exists() and segment_path.stat().st_size > 0:
                     segment_paths.append(segment_path)
 
@@ -4415,24 +4524,62 @@ class FrameEditorApp:
                 return False
             append_log(f"audio_concat segments={len(segment_paths)}")
             self.set_export_progress(f"Audio: joining {len(segment_paths)} segment(s)")
-            subprocess.run(
-                [
-                    ffmpeg,
-                    "-y",
-                    "-f",
-                    "concat",
-                    "-safe",
-                    "0",
-                    "-i",
-                    str(concat_list),
-                    "-c",
-                    "copy",
-                    output_path,
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=True,
-            )
+            try:
+                subprocess.run(
+                    [
+                        ffmpeg,
+                        "-y",
+                        "-f",
+                        "concat",
+                        "-safe",
+                        "0",
+                        "-i",
+                        str(concat_list),
+                        "-c",
+                        "copy",
+                        output_path,
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=True,
+                )
+            except (OSError, subprocess.CalledProcessError):
+                if not prefer_copy_audio:
+                    raise
+                append_log("audio_concat_copy_failed fallback=aac")
+                segment_paths = []
+                for segment_number, (source_path, start_frame, end_frame, source_fps) in enumerate(ranges, start=1):
+                    segment_fps = max(float(source_fps or self.fps), 0.001)
+                    start_time = start_frame / segment_fps
+                    duration = max(0.001, (end_frame - start_frame) / segment_fps)
+                    segment_path = audio_dir / f"audio_aac_{segment_number:04d}.m4a"
+                    self.set_export_progress(f"Audio: rebuilding segment {segment_number}/{len(ranges)}")
+                    self.extract_audio_segment(ffmpeg, source_path, start_time, duration, segment_path, False)
+                    if segment_path.exists() and segment_path.stat().st_size > 0:
+                        segment_paths.append(segment_path)
+                if not segment_paths:
+                    return False
+                if not self.write_concat_list(segment_paths, concat_list):
+                    return False
+                self.set_export_progress(f"Audio: joining rebuilt {len(segment_paths)} segment(s)")
+                subprocess.run(
+                    [
+                        ffmpeg,
+                        "-y",
+                        "-f",
+                        "concat",
+                        "-safe",
+                        "0",
+                        "-i",
+                        str(concat_list),
+                        "-c",
+                        "copy",
+                        output_path,
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=True,
+                )
             return output_path.exists() and output_path.stat().st_size > 0
         except (OSError, subprocess.CalledProcessError) as exc:
             append_log(f"audio_build_failed error={type(exc).__name__}")
@@ -5142,6 +5289,7 @@ class FrameEditorApp:
         self.frame_source_type = "images"
         self.source_frame_paths = [None] * output_count
         self.source_frame_indexes = []
+        self.audio_sources = [None] * output_count
         self.set_virtual_frame_list(output_count)
         self.edited_frame_indexes = set(range(output_count))
         self.mask_frame_indexes = set()
@@ -5252,6 +5400,7 @@ class FrameEditorApp:
         self.frame_source_type = "images"
         self.source_frame_paths = [None] * output_count
         self.source_frame_indexes = []
+        self.audio_sources = [None] * output_count
         self.set_virtual_frame_list(output_count)
         self.edited_frame_indexes = set(range(output_count))
         self.mask_frame_indexes = set()
@@ -8415,6 +8564,70 @@ class FrameEditorApp:
         self.tk_root.wait_window(popup)
         return choice["value"]
 
+    def ask_append_fps_mode(self, append_fps):
+        popup = Toplevel(self.tk_root)
+        popup.title("Append Video FPS")
+        popup.resizable(False, False)
+        choice = {"value": None}
+
+        main = Frame(popup, padx=14, pady=12)
+        main.pack()
+        Label(main, text=f"Project is {self.fps:.3f} FPS; appended video is {append_fps:.3f} FPS.").pack(anchor="w")
+        if append_fps > self.fps:
+            Label(main, text="Drop frames to match the project FPS and keep appended audio?").pack(anchor="w", pady=(4, 12))
+            options = ("Drop Frames + Audio", "Append All, No Audio", "Cancel")
+        else:
+            Label(main, text="Matching FPS would require adding frames; appended audio will not be included.").pack(anchor="w", pady=(4, 12))
+            options = ("Append All, No Audio", "Cancel")
+
+        def choose(value):
+            choice["value"] = value
+            popup.destroy()
+
+        buttons = Frame(main)
+        buttons.pack(anchor="e")
+        for label in options:
+            Button(buttons, text=label, command=lambda value=label: choose(value)).pack(side="left", padx=(0, 8))
+
+        popup.protocol("WM_DELETE_WINDOW", lambda: choose("Cancel"))
+        popup.grab_set()
+        self.tk_root.wait_window(popup)
+        return choice["value"]
+
+    def build_append_video_plan(self, append_paths, video_path, append_fps):
+        source_path = str(video_path)
+        source_count = len(append_paths)
+        if source_count <= 0:
+            return []
+        if abs(append_fps - self.fps) <= 0.01:
+            return [
+                (append_paths[index], (source_path, index, index + 1, append_fps))
+                for index in range(source_count)
+            ]
+
+        mode = self.ask_append_fps_mode(append_fps)
+        if mode in (None, "Cancel"):
+            return None
+        if mode == "Append All, No Audio" or append_fps <= self.fps:
+            return [(path, None) for path in append_paths]
+
+        ratio = append_fps / max(self.fps, 0.001)
+        output_count = max(1, int(round(source_count / ratio)))
+        plan = []
+        previous_start = -1
+        for output_index in range(output_count):
+            source_start = min(source_count - 1, int(round(output_index * ratio)))
+            source_end = min(source_count, max(source_start + 1, int(round((output_index + 1) * ratio))))
+            if source_start <= previous_start and previous_start + 1 < source_count:
+                source_start = previous_start + 1
+                source_end = max(source_start + 1, source_end)
+            previous_start = source_start
+            plan.append((append_paths[source_start], (source_path, source_start, source_end, append_fps)))
+        if plan:
+            path, (source_path_value, source_start, _source_end, source_fps) = plan[-1]
+            plan[-1] = (path, (source_path_value, source_start, source_count, source_fps))
+        return plan
+
     def append_frame_after_current(self):
         if not self.frames:
             return
@@ -8476,6 +8689,9 @@ class FrameEditorApp:
             self.frame_source_type = "images"
             self.source_frame_paths = [None] * frame_count
             self.source_frame_paths.insert(insert_index, None)
+        if len(self.audio_sources) < frame_count:
+            self.audio_sources = (self.audio_sources + [None] * frame_count)[:frame_count]
+        self.audio_sources.insert(insert_index, None)
         self.edited_frame_indexes = {
             index if index < insert_index else index + 1
             for index in self.edited_frame_indexes
@@ -8510,7 +8726,7 @@ class FrameEditorApp:
             return
 
         path = filedialog.askopenfilename(
-            title="Append video or animation",
+            title="Insert video or animation",
             filetypes=[("Video Files", SUPPORTED_VIDEO_TYPES)],
         )
         if not path:
@@ -8527,27 +8743,36 @@ class FrameEditorApp:
         self.close_menus()
         current_size = self.get_current_frame_size()
         append_fps = self.detect_fps(video_path)
-        self.loading_message = f"Appending {video_path.name}..."
-        self.force_redraw()
+        self.begin_long_operation("Please Wait... Preparing insert", f"Preparing {video_path.name}...")
 
         try:
             self.extract_frames_to_dir(video_path, APPEND_TEMP_DIR, clear_output=True)
         except (OSError, subprocess.CalledProcessError, RuntimeError) as exc:
             self.loading_message = ""
+            self.hide_wait_popup()
             self.show_file_error("append video", video_path, exc)
             return
 
         append_paths = sorted(APPEND_TEMP_DIR.glob("frame_*.png"))
         if not append_paths:
             self.loading_message = ""
+            self.hide_wait_popup()
             self.set_status("No frames found in appended video")
             return
+        self.hide_wait_popup()
+        append_plan = self.build_append_video_plan(append_paths, video_path, append_fps)
+        if append_plan is None:
+            self.loading_message = ""
+            self.set_status("Insert cancelled")
+            return
         original_count = len(self.frame_paths)
-        if not self.can_write_frame_edits(range(original_count, original_count + len(append_paths))):
+        insert_index = self.current_index + 1
+        appended_count = len(append_plan)
+        if not self.can_write_frame_edits(range(insert_index, insert_index + appended_count)):
             self.loading_message = ""
             return
 
-        first = self.open_image_copy(append_paths[0], "RGBA", "open appended video frame")
+        first = self.open_image_copy(append_plan[0][0], "RGBA", "open appended video frame")
         if first is None:
             self.loading_message = ""
             return
@@ -8558,42 +8783,101 @@ class FrameEditorApp:
                 self.loading_message = ""
                 return
 
-        start_index = original_count + 1
+        self.begin_long_operation("Please Wait... Inserting video", f"Inserting {video_path.name}...")
+        self.wait_for_pending_frame_saves()
         self.release_file_caches()
-        for offset, src in enumerate(append_paths):
-            self.loading_message = f"Appending frames... {offset + 1}/{len(append_paths)}"
+        disk_indexes = set()
+        with self.frame_buffer_lock:
+            disk_indexes = set(self.disk_frame_indexes)
+        for i in range(original_count - 1, insert_index - 1, -1):
+            src = self.frame_temp_path(i)
+            dst = self.frame_temp_path(i + appended_count)
+            if i in disk_indexes:
+                if src.exists():
+                    if not self.rename_path_retry(src, dst):
+                        self.hide_wait_popup()
+                        return
+                else:
+                    self.unmark_disk_frame_index(i)
+            if i in self.mask_frame_indexes:
+                mask_src = self.frame_mask_path(i)
+                mask_dst = self.frame_mask_path(i + appended_count)
+                if mask_src.exists() and not self.rename_path_retry(mask_src, mask_dst):
+                    self.hide_wait_popup()
+                    return
+            if i in self.source_mask_frame_indexes:
+                mask_src = self.frame_source_mask_path(i)
+                mask_dst = self.frame_source_mask_path(i + appended_count)
+                if mask_src.exists() and not self.rename_path_retry(mask_src, mask_dst):
+                    self.hide_wait_popup()
+                    return
+
+        for offset, (src, _audio_source) in enumerate(append_plan):
+            self.loading_message = f"Inserting frames... {offset + 1}/{len(append_plan)}"
             if offset % 5 == 0:
+                self.update_wait_popup(self.loading_message)
                 self.force_redraw()
             image = self.open_image_copy(src, "RGBA", "open appended video frame")
             if image is None:
                 self.loading_message = ""
+                self.hide_wait_popup()
                 return
             if image.size != current_size:
                 image = self.resize_image_for_append(image, current_size, resize_mode)
-            dst = TEMP_DIR / f"frame_{start_index + offset:06d}.png"
-            if not self.save_image_retry(image, dst, "save appended video frame"):
+            dst = self.frame_temp_path(insert_index + offset)
+            if not self.save_image_retry(image, dst, "save inserted video frame"):
                 self.loading_message = ""
+                self.hide_wait_popup()
                 return
 
-        appended_count = len(append_paths)
         if self.frame_source_type == "images":
-            self.source_frame_paths.extend([None] * appended_count)
+            self.source_frame_paths[insert_index:insert_index] = [None] * appended_count
         elif self.frame_source_type == "video":
-            self.source_frame_indexes.extend(range(original_count, original_count + appended_count))
+            source_indexes = self.source_frame_indexes.materialize()
+            source_indexes[insert_index:insert_index] = [insert_index + offset for offset in range(appended_count)]
         else:
             self.frame_source_type = "images"
-            self.source_frame_paths = [None] * (original_count + appended_count)
+            self.source_frame_paths = [None] * original_count
+            self.source_frame_paths[insert_index:insert_index] = [None] * appended_count
+        if len(self.audio_sources) < original_count:
+            self.audio_sources = (self.audio_sources + [None] * original_count)[:original_count]
+        self.audio_sources[insert_index:insert_index] = [audio_source for _path, audio_source in append_plan]
         self.set_virtual_frame_list(original_count + appended_count)
-        self.edited_frame_indexes.update(range(original_count, original_count + appended_count))
-        self.current_index = start_index - 1
+        self.edited_frame_indexes = {
+            index if index < insert_index else index + appended_count
+            for index in self.edited_frame_indexes
+        }
+        self.edited_frame_indexes.update(range(insert_index, insert_index + appended_count))
+        self.mask_frame_indexes = {
+            index if index < insert_index else index + appended_count
+            for index in self.mask_frame_indexes
+        }
+        self.source_mask_frame_indexes = {
+            index if index < insert_index else index + appended_count
+            for index in self.source_mask_frame_indexes
+        }
+        self.frame_buffer_order = [
+            index if index < insert_index else index + appended_count
+            for index in self.frame_buffer_order
+        ]
+        with self.frame_buffer_lock:
+            self.disk_frame_indexes = {
+                index if index < insert_index else index + appended_count
+                for index in self.disk_frame_indexes
+            }
+            self.disk_frame_indexes.update(range(insert_index, insert_index + appended_count))
+        self.current_index = insert_index
         self.set_loader_targets(self.current_index)
         self.reset_after_frame_list_change()
         self.loading_message = ""
+        self.hide_wait_popup()
 
         fps_note = ""
-        if abs(append_fps - self.fps) > 0.01:
-            fps_note = f"; appended source was {append_fps:.3f} FPS"
-        self.set_status(f"Appended {len(append_paths)} video frames{fps_note}", 5000)
+        if abs(append_fps - self.fps) > 0.01 and any(audio_source is not None for _path, audio_source in append_plan):
+            fps_note = f"; dropped to {self.fps:.3f} FPS with audio"
+        elif abs(append_fps - self.fps) > 0.01:
+            fps_note = f"; appended source was {append_fps:.3f} FPS, audio not included"
+        self.set_status(f"Inserted {appended_count} video frames{fps_note}", 5000)
 
     def delete_current_frame(self):
         if not self.frames:
@@ -8629,6 +8913,8 @@ class FrameEditorApp:
             self.source_frame_paths.pop(delete_index)
         if self.frame_source_type == "video" and delete_index < len(self.source_frame_indexes):
             self.source_frame_indexes.pop(delete_index)
+        if delete_index < len(self.audio_sources):
+            self.audio_sources.pop(delete_index)
 
         self.edited_frame_indexes = {
             index if index < delete_index else index - 1
@@ -8729,6 +9015,8 @@ class FrameEditorApp:
             self.source_frame_paths = self.source_frame_paths[keep_start:keep_end]
         elif self.frame_source_type == "video":
             self.source_frame_indexes = self.source_frame_indexes[keep_start:keep_end]
+        if self.audio_sources:
+            self.audio_sources = self.audio_sources[keep_start:keep_end]
 
         kept_edited = set()
         for index in self.edited_frame_indexes:
@@ -8795,7 +9083,7 @@ class FrameEditorApp:
         return [
             ("Open Video...", self.hotkey_label("open_video"), self.open_video, True),
             ("Open Image Folder...", "", self.open_image_folder, True),
-            ("Append Video...", "", self.append_video_frames, bool(self.frames)),
+            ("Insert Video After Current...", "", self.append_video_frames, bool(self.frames)),
             ("Reload Source", self.hotkey_label("reload_source"), self.reload_video, self.video_path is not None),
             ("Settings...", "", self.open_settings, True),
             ("Retarget Size/FPS...", self.hotkey_label("retarget"), self.retarget_size_fps, bool(self.frames)),
