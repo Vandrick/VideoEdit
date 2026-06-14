@@ -40,6 +40,9 @@ CHECKER_LIGHT = (178, 178, 178)
 CHECKER_DARK = (112, 112, 112)
 CHECKER_SIZE = 16
 PREVIEW_BACKGROUNDS = ("Checker", "Black", "White")
+EXPORT_MODE_FAST = "Fast Verified"
+EXPORT_MODE_SLOW = "Slow Exact"
+EXPORT_MODES = (EXPORT_MODE_FAST, EXPORT_MODE_SLOW)
 
 WINDOW_W = 1400
 WINDOW_H = 900
@@ -69,13 +72,14 @@ VIDEO_PLAYER_JUMP_RESET_FRAMES = DISK_PRELOAD_WORKER_CHUNK_SIZE
 FULL_CACHE_RADIUS = MEMORY_PRELOAD_AFTER
 VIDEO_FRAME_BUFFER_LIMIT = 500
 ENABLE_FRAME_SWITCH_PROFILING = False
-ENABLE_LOGGING = False
+ENABLE_LOGGING = True
 FRAME_SWITCH_PROFILE_MIN_MS = 4.0
 THUMB_SPACING = 8
 TIMELINE_SIDE_PAD = 20
 FILE_RETRY_COUNT = 12
 FILE_RETRY_DELAY = 0.08
 MAX_EXPORT_STAGING_BYTES = 50 * 1024 * 1024 * 1024
+X264_EXPORT_PRESET = "veryfast"
 FULL_EXPORT_WARNING_FRAMES = 1000
 GIF_EXPORT_WARNING_FRAMES = 500
 LARGE_OPERATION_FRAME_LIMIT = 500
@@ -83,6 +87,9 @@ EDITED_FRAME_LIMIT = 500
 RIFE_FRAME_LIMIT = 500
 EDIT_CHUNK_SEAL_DISTANCE = 300
 EDIT_CHUNK_MIN_FRAMES = 2
+FAST_EXPORT_COPY_PROBE_FRAME_LIMIT = 5000
+FAST_EXPORT_FULL_VERIFY_FRAME_LIMIT = 5000
+FAST_EXPORT_START_PREROLL_FRAMES = 2
 SUPPORTED_VIDEO_TYPES = ".mp4 .mov .avi .mkv .webm .m4v .gif"
 SUPPORTED_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".gif"}
 DEFAULT_IMAGE_FPS = 16.0
@@ -615,6 +622,7 @@ class FrameEditorApp:
         self.frame_paths = []
         self.current_index = 0
         self.hotkeys = dict(DEFAULT_HOTKEYS)
+        self.export_mode = EXPORT_MODE_FAST
         self.hotkey_popup = None
         self.target_frame = 0
         self.preview_target_frame = 0
@@ -652,6 +660,7 @@ class FrameEditorApp:
         self.edit_chunks = {}
         self.edit_chunk_running = False
         self.edit_chunk_lock = threading.Lock()
+        self.h264_encoder_args_cache = None
         self.source_save_lock = threading.Lock()
         self.source_save_queue = {}
         self.source_save_running = False
@@ -688,6 +697,7 @@ class FrameEditorApp:
         self.status_message = ""
         self.status_until = 0
         self.loading_message = ""
+        self.last_smart_export_error = ""
         self.file_menu_open = False
         self.active_menu = None
         self.menu_rects = {}
@@ -754,12 +764,13 @@ class FrameEditorApp:
         self.tk_root = Tk()
         self.tk_root.withdraw()
         self.create_wait_popup()
-        self.load_hotkeys()
+        self.load_settings()
         self.check_ffmpeg_on_startup()
 
-    # ---------- hotkeys ----------
-    def load_hotkeys(self):
+    # ---------- settings / hotkeys ----------
+    def load_settings(self):
         self.hotkeys = dict(DEFAULT_HOTKEYS)
+        self.export_mode = EXPORT_MODE_FAST
         config = configparser.ConfigParser()
         try:
             config.read(CONFIG_PATH, encoding="utf-8")
@@ -768,14 +779,32 @@ class FrameEditorApp:
                     value = config.get("Hotkeys", action, fallback=self.hotkeys[action]).strip()
                     if value:
                         self.hotkeys[action] = value
+            if config.has_section("Export"):
+                value = config.get("Export", "mode", fallback=self.export_mode).strip()
+                if value in EXPORT_MODES:
+                    self.export_mode = value
         except Exception:
             self.hotkeys = dict(DEFAULT_HOTKEYS)
+            self.export_mode = EXPORT_MODE_FAST
 
-    def save_hotkeys(self):
+    def save_settings(self):
         config = configparser.ConfigParser()
+        try:
+            config.read(CONFIG_PATH, encoding="utf-8")
+        except Exception:
+            config = configparser.ConfigParser()
         config["Hotkeys"] = {action: self.hotkeys.get(action, DEFAULT_HOTKEYS[action]) for action in HOTKEY_ORDER}
+        if not config.has_section("Export"):
+            config.add_section("Export")
+        config.set("Export", "mode", self.export_mode if self.export_mode in EXPORT_MODES else EXPORT_MODE_FAST)
         with CONFIG_PATH.open("w", encoding="utf-8") as file:
             config.write(file)
+
+    def load_hotkeys(self):
+        self.load_settings()
+
+    def save_hotkeys(self):
+        self.save_settings()
 
     def hotkey_label(self, action):
         return self.hotkeys.get(action, DEFAULT_HOTKEYS.get(action, ""))
@@ -1153,6 +1182,54 @@ class FrameEditorApp:
             return None
         return tool
 
+    def h264_encoder_candidates(self):
+        return [
+            ("NVIDIA NVENC", ["-c:v", "h264_nvenc", "-preset", "p4"]),
+            ("Intel Quick Sync", ["-c:v", "h264_qsv", "-preset", "veryfast"]),
+            ("AMD AMF", ["-c:v", "h264_amf", "-quality", "speed"]),
+            ("x264 CPU", ["-c:v", "libx264", "-preset", X264_EXPORT_PRESET]),
+        ]
+
+    def h264_encoder_works(self, ffmpeg, args):
+        null_output = "NUL" if IS_WINDOWS else os.devnull
+        try:
+            result = subprocess.run(
+                [
+                    ffmpeg,
+                    "-hide_banner",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=c=black:s=64x64:r=1:d=0.1",
+                    "-frames:v",
+                    "1",
+                    *args,
+                    "-f",
+                    "null",
+                    null_output,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=8,
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def get_h264_encoder_args(self, ffmpeg):
+        if self.h264_encoder_args_cache is not None:
+            return list(self.h264_encoder_args_cache)
+        for label, args in self.h264_encoder_candidates():
+            if self.h264_encoder_works(ffmpeg, args):
+                self.h264_encoder_args_cache = tuple(args)
+                self.set_status(f"Using {label} encoder", 3500)
+                return list(args)
+        fallback = ("-c:v", "libx264", "-preset", X264_EXPORT_PRESET)
+        self.h264_encoder_args_cache = fallback
+        return list(fallback)
+
     def build_ffmpeg_install_message(self):
         working_dir = Path.cwd().resolve()
         curl_path = shutil.which("curl")
@@ -1364,6 +1441,48 @@ class FrameEditorApp:
             return max(0, int(round(duration * self.detect_fps(file_path))))
         except Exception:
             return 0
+
+    def detect_decoded_frame_count(self, file_path):
+        try:
+            ffprobe = self.get_ffmpeg_tool("ffprobe")
+            if not ffprobe:
+                return 0
+            cmd = [
+                ffprobe,
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-count_frames",
+                "-show_entries", "stream=nb_read_frames,nb_frames,duration",
+                "-of", "json",
+                str(file_path),
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            data = json.loads(result.stdout)
+            stream = data.get("streams", [{}])[0]
+            for key in ("nb_read_frames", "nb_frames"):
+                value = stream.get(key)
+                if value and str(value).isdigit():
+                    return int(value)
+            duration = float(stream.get("duration") or 0)
+            return max(0, int(round(duration * self.detect_fps(file_path))))
+        except Exception:
+            return 0
+
+    def verify_export_frame_count(self, file_path, expected_frames, label):
+        if expected_frames <= FAST_EXPORT_FULL_VERIFY_FRAME_LIMIT:
+            actual_frames = self.detect_decoded_frame_count(file_path)
+            method = "decoded"
+        else:
+            actual_frames = self.detect_frame_count(file_path)
+            method = "metadata"
+        append_log(f"{label}_frame_count method={method} expected={expected_frames} actual={actual_frames}")
+        return actual_frames, method
+
+    def set_export_progress(self, message):
+        self.loading_message = message
+        append_log(f"export_progress {message}")
+        self.update_wait_popup(message)
+        self.force_redraw()
 
     def clear_temp_frames(self):
         if TEMP_DIR.exists():
@@ -2700,7 +2819,8 @@ class FrameEditorApp:
                 return path, False
             with self.compress_lock:
                 has_compressed = index in self.compressed_frame_bytes
-            if self.frame_has_read_mask(index) or has_compressed:
+                has_chunk = self.frame_storage.get(index, {}).get("kind") == "chunk"
+            if self.frame_has_read_mask(index) or has_compressed or has_chunk:
                 append_log(f"resolve_edited_memory_or_mask index={index} path={path}")
                 return None, False
             append_log(
@@ -2780,6 +2900,9 @@ class FrameEditorApp:
         compressed = self.get_compressed_frame_image(index, mode)
         if compressed is not None:
             return compressed
+        chunked = self.get_chunk_frame_image(index, mode)
+        if chunked is not None:
+            return chunked
         return None
 
     def get_compressed_frame_image(self, index, mode="RGBA"):
@@ -2790,6 +2913,50 @@ class FrameEditorApp:
         try:
             with Image.open(io.BytesIO(data)) as image:
                 return image.convert(mode).copy() if mode else image.copy()
+        except Exception:
+            return None
+
+    def get_chunk_frame_image(self, index, mode="RGBA"):
+        with self.compress_lock:
+            entry = dict(self.frame_storage.get(index) or {})
+        if entry.get("kind") != "chunk":
+            return None
+        chunk_path = Path(entry.get("chunk", ""))
+        if not chunk_path.exists():
+            return None
+        chunk_start = int(entry.get("chunk_start", index))
+        offset = max(0.0, (index - chunk_start) / max(self.fps, 0.001))
+        ffmpeg = self.find_app_tool("ffmpeg")
+        if not ffmpeg:
+            return None
+        try:
+            result = subprocess.run(
+                [
+                    ffmpeg,
+                    "-v",
+                    "error",
+                    "-ss",
+                    f"{offset:.6f}",
+                    "-i",
+                    str(chunk_path),
+                    "-frames:v",
+                    "1",
+                    "-f",
+                    "image2pipe",
+                    "-vcodec",
+                    "png",
+                    "pipe:1",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=True,
+            )
+            if not result.stdout:
+                return None
+            with Image.open(io.BytesIO(result.stdout)) as image:
+                decoded = image.convert(mode).copy() if mode else image.copy()
+            self.cache_pil_frame(index, decoded, queue_pygame=True)
+            return decoded.copy()
         except Exception:
             return None
 
@@ -2822,6 +2989,7 @@ class FrameEditorApp:
                     return
                 index, (version, image) = self.compress_queue.popitem()
             try:
+                has_alpha = self.alpha_has_transparency(image.getchannel("A"))
                 buffer = io.BytesIO()
                 image.save(buffer, format="PNG", optimize=True)
                 data = buffer.getvalue()
@@ -2837,6 +3005,7 @@ class FrameEditorApp:
                     "kind": "compressed",
                     "version": version,
                     "bytes": len(data),
+                    "has_alpha": has_alpha,
                     "updated": time.time(),
                 }
             self.schedule_edit_chunk_seal()
@@ -2863,6 +3032,7 @@ class FrameEditorApp:
                     and index not in self.mask_frame_indexes
                     and abs(index - target) > EDIT_CHUNK_SEAL_DISTANCE
                     and self.frame_storage.get(index, {}).get("kind") != "chunk"
+                    and not self.frame_storage.get(index, {}).get("has_alpha", False)
                 ]
             if not candidates:
                 return
@@ -2915,8 +3085,7 @@ class FrameEditorApp:
                     str(self.fps),
                     "-i",
                     str(work_dir / "frame_%06d.png"),
-                    "-c:v",
-                    "libx264",
+                    *self.get_h264_encoder_args(ffmpeg),
                     "-pix_fmt",
                     "yuv420p",
                     "-force_key_frames",
@@ -2929,6 +3098,7 @@ class FrameEditorApp:
             )
             if not output_path.exists():
                 return False
+            self.wait_for_pending_frame_saves()
             with self.edit_chunk_lock:
                 self.edit_chunks[(start, end)] = str(output_path)
             with self.compress_lock:
@@ -2941,6 +3111,22 @@ class FrameEditorApp:
                         "chunk_end": end,
                         "updated": time.time(),
                     }
+                    self.compress_queue.pop(index, None)
+            with self.frame_buffer_lock:
+                for index in indexes:
+                    self.disk_frame_indexes.discard(index)
+                    if index in self.frame_buffer_order:
+                        self.frame_buffer_order.remove(index)
+            for index in indexes:
+                self.unlink_path_quiet(self.frame_temp_path(index))
+                with self.cache_lock:
+                    if abs(index - self.get_target_frame()) > MEMORY_PRELOAD_AFTER:
+                        self.pil_cache.pop(index, None)
+                        self.pygame_cache_pending = [item for item in self.pygame_cache_pending if item != index]
+                        self.pygame_cache_pending_set.discard(index)
+                self.full_cache.pop(index, None)
+                self.thumb_cache.pop(index, None)
+                self.large_thumb_cache.pop(index, None)
             return True
         except Exception as exc:
             append_log(f"edit_chunk_error start={start} end={end} error={type(exc).__name__}")
@@ -4014,6 +4200,76 @@ class FrameEditorApp:
             stderr=subprocess.DEVNULL,
             check=True,
         )
+        append_log(f"video_segment_copy_ts_done source_start={start_frame} source_end={end_frame} path={output_path}")
+
+    def run_ffmpeg_segment_copy_ts(self, ffmpeg, start_frame, end_frame, output_path):
+        start_time = start_frame / max(self.fps, 0.001)
+        duration = max(0.001, (end_frame - start_frame) / max(self.fps, 0.001))
+        append_log(
+            f"video_segment_copy_ts source_start={start_frame} source_end={end_frame} "
+            f"start_time={start_time:.6f} duration={duration:.6f} path={output_path}"
+        )
+        subprocess.run(
+            [
+                ffmpeg,
+                "-y",
+                "-ss",
+                f"{start_time:.6f}",
+                "-i",
+                str(self.video_path),
+                "-t",
+                f"{duration:.6f}",
+                "-map",
+                "0:v:0",
+                "-an",
+                "-c:v",
+                "copy",
+                "-avoid_negative_ts",
+                "make_zero",
+                "-bsf:v",
+                "h264_mp4toannexb",
+                "-f",
+                "mpegts",
+                str(output_path),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+
+    def run_ffmpeg_segment_copy_ts_verified(self, ffmpeg, start_frame, end_frame, expected_frames, output_path, work_dir):
+        if expected_frames <= 0:
+            return False
+        if expected_frames > FAST_EXPORT_COPY_PROBE_FRAME_LIMIT:
+            request_end = end_frame
+            if start_frame == 0 and expected_frames > FAST_EXPORT_START_PREROLL_FRAMES:
+                request_end = max(start_frame + 1, end_frame - FAST_EXPORT_START_PREROLL_FRAMES)
+            self.set_export_progress(f"Fast export: copying {expected_frames} frames")
+            append_log(
+                f"copy_ts_large_unverified start={start_frame} end={end_frame} "
+                f"request_end={request_end} expected={expected_frames}"
+            )
+            self.run_ffmpeg_segment_copy_ts(ffmpeg, start_frame, request_end, output_path)
+            return output_path.exists() and output_path.stat().st_size > 0
+
+        min_end = max(start_frame + 1, end_frame - 12)
+        for request_end in range(end_frame, min_end - 1, -1):
+            probe_path = work_dir / f"{output_path.stem}_probe_{request_end}.ts"
+            self.set_export_progress(f"Fast export: probing copy {expected_frames} frames")
+            self.run_ffmpeg_segment_copy_ts(ffmpeg, start_frame, request_end, probe_path)
+            decoded = self.detect_decoded_frame_count(probe_path)
+            append_log(
+                f"copy_ts_probe start={start_frame} request_end={request_end} "
+                f"expected={expected_frames} decoded={decoded}"
+            )
+            if decoded == expected_frames:
+                return bool(self.copy_path_retry(probe_path, output_path, "use verified copy segment"))
+            self.last_smart_export_error = (
+                f"Fast export could not align copy segment {start_frame}-{end_frame}; "
+                "switch File > Settings > Export Mode to Slow Exact. Slow Exact may take about the duration "
+                "of the movie on long videos."
+            )
+        return False
 
     def run_ffmpeg_segment_encode_source(self, ffmpeg, start_frame, end_frame, output_path):
         start_time = start_frame / max(self.fps, 0.001)
@@ -4039,8 +4295,7 @@ class FrameEditorApp:
                 str(self.fps),
                 "-fps_mode",
                 "cfr",
-                "-c:v",
-                "libx264",
+                *self.get_h264_encoder_args(ffmpeg),
                 "-pix_fmt",
                 "yuv420p",
                 str(output_path),
@@ -4093,6 +4348,19 @@ class FrameEditorApp:
         ranges.append((start, previous + 1))
         return ranges
 
+    def can_copy_original_audio_for_export(self):
+        if self.video_path is None or self.frame_source_type != "video" or not self.source_frame_indexes:
+            return False
+        if len(self.source_frame_indexes) != len(self.frame_paths):
+            return False
+        if self.source_frame_indexes[0] != 0:
+            return False
+        for index, source_index in enumerate(self.source_frame_indexes):
+            if int(source_index) != index:
+                return False
+        expected_last = self.detect_frame_count(self.video_path) - 1
+        return expected_last < 0 or self.source_frame_indexes[-1] == expected_last
+
     def build_timeline_audio(self, ffmpeg, output_path):
         ranges = self.source_audio_ranges()
         if not ranges:
@@ -4106,6 +4374,7 @@ class FrameEditorApp:
                 start_time = start_frame / max(self.fps, 0.001)
                 duration = max(0.001, (end_frame - start_frame) / max(self.fps, 0.001))
                 segment_path = audio_dir / f"audio_{segment_number:04d}.m4a"
+                self.set_export_progress(f"Audio: building segment {segment_number}/{len(ranges)}")
                 append_log(
                     f"audio_segment number={segment_number} "
                     f"source_start={start_frame} source_end={end_frame} "
@@ -4138,12 +4407,14 @@ class FrameEditorApp:
             if not segment_paths:
                 return False
             if len(segment_paths) == 1:
+                self.set_export_progress("Audio: finishing")
                 return self.copy_path_retry(segment_paths[0], output_path, "copy timeline audio")
 
             concat_list = audio_dir / "audio_segments.txt"
             if not self.write_concat_list(segment_paths, concat_list):
                 return False
             append_log(f"audio_concat segments={len(segment_paths)}")
+            self.set_export_progress(f"Audio: joining {len(segment_paths)} segment(s)")
             subprocess.run(
                 [
                     ffmpeg,
@@ -4174,7 +4445,7 @@ class FrameEditorApp:
             return False
         total = max(0, end_frame - start_frame)
         for offset, index in enumerate(range(start_frame, end_frame), start=1):
-            self.loading_message = f"Staging edited range... {offset}/{total}"
+            self.loading_message = f"Staging patch frames... {offset}/{total}"
             if offset == 1 or offset % 5 == 0:
                 self.update_wait_popup(self.loading_message)
                 self.force_redraw()
@@ -4206,8 +4477,7 @@ class FrameEditorApp:
                 str(self.fps),
                 "-fps_mode",
                 "cfr",
-                "-c:v",
-                "libx264",
+                *self.get_h264_encoder_args(ffmpeg),
                 "-pix_fmt",
                 "yuv420p",
                 str(output_path),
@@ -4218,85 +4488,334 @@ class FrameEditorApp:
         )
         return True
 
-    def try_export_video_smart(self, ffmpeg, save_path):
-        if not self.can_smart_export_video():
+    def run_ffmpeg_range_encode_ts(self, ffmpeg, start_frame, end_frame, output_path, frames_dir):
+        self.set_export_progress(f"Fast export: staging patch {end_frame - start_frame} frames")
+        if not self.stage_frame_range_for_export(start_frame, end_frame, frames_dir):
             return False
-        ranges = self.smart_export_ranges()
-        if not ranges:
+        append_log(f"video_segment_encode_ts output_start={start_frame} output_end={end_frame} frames={end_frame - start_frame} path={output_path}")
+        self.set_export_progress(f"Fast export: encoding patch {end_frame - start_frame} frames")
+        subprocess.run(
+            [
+                ffmpeg,
+                "-y",
+                "-framerate",
+                str(self.fps),
+                "-i",
+                str(frames_dir / "frame_%06d.png"),
+                "-r",
+                str(self.fps),
+                "-fps_mode",
+                "cfr",
+                *self.get_h264_encoder_args(ffmpeg),
+                "-pix_fmt",
+                "yuv420p",
+                "-bsf:v",
+                "h264_mp4toannexb",
+                "-f",
+                "mpegts",
+                str(output_path),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+        decoded = self.detect_decoded_frame_count(output_path)
+        expected = max(0, end_frame - start_frame)
+        self.set_export_progress(f"Fast export: verifying patch {expected} frames")
+        append_log(f"video_segment_encode_ts_done output_start={start_frame} output_end={end_frame} expected={expected} decoded={decoded}")
+        if decoded != expected:
+            self.last_smart_export_error = (
+                f"Fast export edited segment {start_frame}-{end_frame} produced {decoded} frames, "
+                f"expected {expected}. Switch File > Settings > Export Mode to Slow Exact. Slow Exact may "
+                "take about the duration of the movie on long videos."
+            )
+            return False
+        return True
+
+    def source_output_runs(self, start_index, end_index):
+        runs = []
+        if start_index >= end_index:
+            return runs
+        run_start_output = start_index
+        run_start_source = int(self.source_frame_indexes[start_index])
+        previous_source = run_start_source
+        for output_index in range(start_index + 1, end_index):
+            source_index = int(self.source_frame_indexes[output_index])
+            if source_index == previous_source + 1:
+                previous_source = source_index
+                continue
+            runs.append((run_start_output, output_index, run_start_source, previous_source + 1))
+            run_start_output = output_index
+            run_start_source = source_index
+            previous_source = source_index
+        runs.append((run_start_output, end_index, run_start_source, previous_source + 1))
+        return runs
+
+    def run_ffmpeg_smart_filter_export(self, ffmpeg, ranges, output_path):
+        image_inputs = []
+        segment_filters = []
+        segment_labels = []
+        cursor = 0
+        width, height, output_fps = self.get_retarget_settings()
+        width = self.make_even(width)
+        height = self.make_even(height)
+
+        def normalize_filter(input_label, output_label):
+            return (
+                f"{input_label}"
+                f"fps={output_fps},"
+                f"scale={width}:{height}:flags=bicubic,"
+                "setsar=1,"
+                "format=yuv420p,"
+                f"setpts=PTS-STARTPTS[{output_label}]"
+            )
+
+        def add_source_segments(start_index, end_index):
+            nonlocal segment_filters, segment_labels
+            for _output_start, _output_end, source_start, source_end in self.source_output_runs(start_index, end_index):
+                if source_end <= source_start:
+                    continue
+                label = f"v{len(segment_labels)}"
+                segment_filters.append(
+                    normalize_filter(f"[0:v]trim=start_frame={source_start}:end_frame={source_end},", label)
+                )
+                segment_labels.append(label)
+
+        for range_number, (start, end) in enumerate(ranges, start=1):
+            add_source_segments(cursor, start)
+            frames_dir = SMART_EXPORT_DIR / f"range_frames_{range_number:04d}"
+            if not self.stage_frame_range_for_export(start, end, frames_dir):
+                return False
+            input_number = len(image_inputs) + 1
+            image_inputs.append(frames_dir)
+            label = f"v{len(segment_labels)}"
+            segment_filters.append(normalize_filter(f"[{input_number}:v]", label))
+            segment_labels.append(label)
+            cursor = end
+
+        add_source_segments(cursor, len(self.frame_paths))
+        if not segment_labels:
             return False
 
-        if not self.clear_work_folder(SMART_EXPORT_DIR, "clear smart export"):
-            return False
+        if len(segment_labels) == 1:
+            output_label = segment_labels[0]
+            filter_complex = ";".join(segment_filters)
+        else:
+            output_label = "vout"
+            concat_inputs = "".join(f"[{label}]" for label in segment_labels)
+            segment_filters.append(f"{concat_inputs}concat=n={len(segment_labels)}:v=1:a=0[{output_label}]")
+            filter_complex = ";".join(segment_filters)
 
+        args = [ffmpeg, "-y", "-i", str(self.video_path)]
+        for frames_dir in image_inputs:
+            args.extend(["-framerate", str(self.fps), "-i", str(frames_dir / "frame_%06d.png")])
+        args.extend(
+            [
+                "-filter_complex",
+                filter_complex,
+                "-map",
+                f"[{output_label}]",
+                "-r",
+                str(output_fps),
+                "-fps_mode",
+                "cfr",
+                *self.get_h264_encoder_args(ffmpeg),
+                "-pix_fmt",
+                "yuv420p",
+                str(output_path),
+            ]
+        )
+        append_log(f"smart_filter_export segments={len(segment_labels)} ranges={len(ranges)} images={len(image_inputs)}")
+        result = subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        if result.returncode != 0:
+            lines = [line.strip() for line in (result.stderr or "").splitlines() if line.strip()]
+            useful = lines[-8:] if lines else ["ffmpeg smart filter export failed"]
+            self.last_smart_export_error = "\n".join(useful)
+            return False
+        return output_path.exists() and output_path.stat().st_size > 0
+
+    def run_ffmpeg_smart_fast_export(self, ffmpeg, ranges, output_path):
         segment_paths = []
         cursor = 0
-        segment_number = 1
-        try:
-            for start, end in ranges:
-                if cursor < start:
-                    path = SMART_EXPORT_DIR / f"segment_{segment_number:04d}_source.mp4"
-                    self.loading_message = f"Encoding original segment {segment_number}..."
-                    self.force_redraw()
-                    append_log(f"smart_segment number={segment_number} type=source_encode output_start={cursor} output_end={start}")
-                    self.run_ffmpeg_output_range_encode_source(ffmpeg, cursor, start, path)
-                    segment_paths.append(path)
-                    segment_number += 1
+        segment_dir = SMART_EXPORT_DIR / "fast_segments"
+        if not self.clear_work_folder(segment_dir, "clear fast smart export segments"):
+            return False
+        patch_frames = sum(max(0, end - start) for start, end in ranges)
+        append_log(
+            f"smart_fast_preflight ranges={len(ranges)} patch_frames={patch_frames} "
+            f"timeline_frames={len(self.frame_paths)} ranges_text={','.join(f'{start}-{end}' for start, end in ranges)}"
+        )
+        self.set_export_progress(f"Fast export: {len(ranges)} patch range(s), {patch_frames} frames")
 
-                path = SMART_EXPORT_DIR / f"segment_{segment_number:04d}_edit.mp4"
-                self.loading_message = f"Encoding edited segment {segment_number}..."
-                self.force_redraw()
-                append_log(f"smart_segment number={segment_number} type=edit output_start={start} output_end={end}")
-                if not self.run_ffmpeg_range_encode(ffmpeg, start, end, path):
+        try:
+            for range_number, (start, end) in enumerate(ranges, start=1):
+                if cursor < start:
+                    for output_start, output_end, source_start, source_end in self.source_output_runs(cursor, start):
+                        if source_end <= source_start:
+                            continue
+                        segment_path = segment_dir / f"copy_{len(segment_paths) + 1:04d}_{source_start}_{source_end}.ts"
+                        append_log(
+                            f"smart_fast_copy_start segment={len(segment_paths) + 1} "
+                            f"output={output_start}-{output_end} source={source_start}-{source_end}"
+                        )
+                        self.set_export_progress(
+                            f"Fast export: copy segment {len(segment_paths) + 1} "
+                            f"({output_end - output_start} frames)"
+                        )
+                        if not self.run_ffmpeg_segment_copy_ts_verified(
+                            ffmpeg,
+                            source_start,
+                            source_end,
+                            output_end - output_start,
+                            segment_path,
+                            segment_dir,
+                        ):
+                            return False
+                        segment_paths.append(segment_path)
+                        append_log(f"smart_fast_copy_done segment={len(segment_paths)} path={segment_path}")
+                        self.set_export_progress(f"Fast export: copy segment {len(segment_paths)} done")
+
+                segment_path = segment_dir / f"edit_{len(segment_paths) + 1:04d}_{start}_{end}.ts"
+                frames_dir = segment_dir / f"edit_frames_{range_number:04d}"
+                append_log(
+                    f"smart_fast_edit_start segment={len(segment_paths) + 1} "
+                    f"range={start}-{end} frames={end - start}"
+                )
+                self.set_export_progress(
+                    f"Fast export: patch segment {range_number}/{len(ranges)} ({end - start} frames)"
+                )
+                if not self.run_ffmpeg_range_encode_ts(ffmpeg, start, end, segment_path, frames_dir):
                     return False
-                segment_paths.append(path)
-                segment_number += 1
+                segment_paths.append(segment_path)
+                append_log(f"smart_fast_edit_done segment={len(segment_paths)} path={segment_path}")
+                self.set_export_progress(f"Fast export: patch segment {range_number}/{len(ranges)} done")
                 cursor = end
 
             if cursor < len(self.frame_paths):
-                path = SMART_EXPORT_DIR / f"segment_{segment_number:04d}_source.mp4"
-                self.loading_message = f"Encoding original segment {segment_number}..."
-                self.force_redraw()
-                append_log(f"smart_segment number={segment_number} type=source_encode output_start={cursor} output_end={len(self.frame_paths)}")
-                self.run_ffmpeg_output_range_encode_source(ffmpeg, cursor, len(self.frame_paths), path)
-                segment_paths.append(path)
+                for output_start, output_end, source_start, source_end in self.source_output_runs(cursor, len(self.frame_paths)):
+                    if source_end <= source_start:
+                        continue
+                    segment_path = segment_dir / f"copy_{len(segment_paths) + 1:04d}_{source_start}_{source_end}.ts"
+                    append_log(
+                        f"smart_fast_copy_start segment={len(segment_paths) + 1} "
+                        f"output={output_start}-{output_end} source={source_start}-{source_end}"
+                    )
+                    self.set_export_progress(
+                        f"Fast export: copy segment {len(segment_paths) + 1} "
+                        f"({output_end - output_start} frames)"
+                    )
+                    if not self.run_ffmpeg_segment_copy_ts_verified(
+                        ffmpeg,
+                        source_start,
+                        source_end,
+                        output_end - output_start,
+                        segment_path,
+                        segment_dir,
+                    ):
+                        return False
+                    segment_paths.append(segment_path)
+                    append_log(f"smart_fast_copy_done segment={len(segment_paths)} path={segment_path}")
+                    self.set_export_progress(f"Fast export: copy segment {len(segment_paths)} done")
 
-            concat_video = SMART_EXPORT_DIR / "_smart_video_only.mp4"
-            concat_list = SMART_EXPORT_DIR / "segments.txt"
-            if not self.write_concat_list(segment_paths, concat_list):
+            if not segment_paths:
                 return False
-            self.loading_message = "Joining smart export segments..."
-            self.force_redraw()
-            append_log(f"smart_concat_reencode segments={len(segment_paths)} path={concat_video}")
+            concat_spec = "concat:" + "|".join(str(path.resolve()).replace("\\", "/") for path in segment_paths)
+            append_log(f"smart_fast_concat segments={len(segment_paths)}")
+            self.set_export_progress(f"Fast export: joining {len(segment_paths)} segment(s)")
             subprocess.run(
                 [
                     ffmpeg,
                     "-y",
-                    "-f",
-                    "concat",
-                    "-safe",
-                    "0",
                     "-i",
-                    str(concat_list),
-                    "-an",
-                    "-r",
-                    str(self.fps),
-                    "-fps_mode",
-                    "cfr",
-                    "-c:v",
-                    "libx264",
-                    "-pix_fmt",
-                    "yuv420p",
-                    str(concat_video),
+                    concat_spec,
+                    "-c",
+                    "copy",
+                    "-movflags",
+                    "+faststart",
+                    str(output_path),
                 ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=True,
             )
+            append_log(f"smart_fast_concat_done path={output_path}")
+            self.set_export_progress("Fast export: video join done")
+        except (OSError, subprocess.CalledProcessError) as exc:
+            self.last_smart_export_error = (
+                f"Fast export failed: {exc}. Switch File > Settings > Export Mode to Slow Exact. "
+                "Slow Exact may take about the duration of the movie on long videos."
+            )
+            return False
+
+        expected_frames = len(self.frame_paths)
+        self.set_export_progress("Fast export: checking frame count")
+        decoded_frames, verify_method = self.verify_export_frame_count(output_path, expected_frames, "smart_fast")
+        if decoded_frames and decoded_frames != expected_frames:
+            self.last_smart_export_error = (
+                f"Fast export produced {decoded_frames} video frames by {verify_method} count, but the timeline has "
+                f"{expected_frames} frames. Switch File > Settings > Export Mode to Slow Exact. Slow Exact may "
+                "take about the duration of the movie on long videos."
+            )
+            return False
+        return output_path.exists() and output_path.stat().st_size > 0
+
+    def try_export_video_smart(self, ffmpeg, save_path):
+        self.last_smart_export_error = ""
+        if not self.can_smart_export_video():
+            return False
+        ranges = self.smart_export_ranges()
+        if not ranges:
+            return False
+        append_log(
+            f"smart_export_start mode={self.export_mode} timeline_frames={len(self.frame_paths)} "
+            f"ranges={','.join(f'{start}-{end}' for start, end in ranges)}"
+        )
+
+        if not self.clear_work_folder(SMART_EXPORT_DIR, "clear smart export"):
+            return False
+
+        try:
+            concat_video = SMART_EXPORT_DIR / "_smart_video_only.mp4"
+            self.set_export_progress(f"Export mode: {self.export_mode}")
+            if self.export_mode == EXPORT_MODE_FAST:
+                self.set_export_progress("Building fast verified export...")
+                if not self.run_ffmpeg_smart_fast_export(ffmpeg, ranges, concat_video):
+                    return False
+            else:
+                self.set_export_progress("Building slow exact export...")
+                if not self.run_ffmpeg_smart_filter_export(ffmpeg, ranges, concat_video):
+                    return False
+            expected_frames = len(self.frame_paths)
+            self.set_export_progress("Smart export: checking video frame count")
+            decoded_frames, verify_method = self.verify_export_frame_count(concat_video, expected_frames, "smart_video")
+            if decoded_frames and decoded_frames != expected_frames:
+                self.last_smart_export_error = (
+                    f"Smart export produced {decoded_frames} video frames by {verify_method} count, but the timeline has "
+                    f"{expected_frames} frames. Export stopped to avoid duplicate or missing frames."
+                )
+                return False
 
             timeline_audio = SMART_EXPORT_DIR / "_smart_audio.m4a"
-            has_timeline_audio = self.build_timeline_audio(ffmpeg, timeline_audio)
-            append_log(f"smart_mux_timeline_audio ready={int(has_timeline_audio)} path={timeline_audio}")
-            audio_input = ["-i", str(timeline_audio)] if has_timeline_audio else self.original_audio_input_args()
+            copy_original_audio = self.can_copy_original_audio_for_export()
+            has_timeline_audio = False
+            if copy_original_audio:
+                append_log("smart_audio_copy_original")
+                self.set_export_progress("Audio: copying original")
+                audio_input = ["-i", str(self.video_path)]
+                audio_codec = "copy"
+            else:
+                append_log("smart_audio_build_start")
+                self.set_export_progress("Audio: starting")
+                has_timeline_audio = self.build_timeline_audio(ffmpeg, timeline_audio)
+                append_log(f"smart_audio_build_done ready={int(has_timeline_audio)}")
+                append_log(f"smart_mux_timeline_audio ready={int(has_timeline_audio)} path={timeline_audio}")
+                audio_input = ["-i", str(timeline_audio)] if has_timeline_audio else self.original_audio_input_args()
+                audio_codec = "aac"
+            append_log(
+                f"smart_mux_start audio_ready={int(has_timeline_audio)} "
+                f"copy_original_audio={int(copy_original_audio)} audio_codec={audio_codec} output={save_path}"
+            )
+            self.set_export_progress("Saving final MP4...")
             subprocess.run(
                 [
                     ffmpeg,
@@ -4311,7 +4830,7 @@ class FrameEditorApp:
                     "-c:v",
                     "copy",
                     "-c:a",
-                    "aac",
+                    audio_codec,
                     "-shortest",
                     save_path,
                 ],
@@ -4319,12 +4838,39 @@ class FrameEditorApp:
                 stderr=subprocess.DEVNULL,
                 check=True,
             )
+            append_log(f"smart_mux_done output={save_path}")
+            self.set_export_progress("Final MP4 saved; checking frame count")
+            decoded_frames, verify_method = self.verify_export_frame_count(save_path, expected_frames, "smart_output")
+            if decoded_frames and decoded_frames != expected_frames:
+                self.last_smart_export_error = (
+                    f"Final export produced {decoded_frames} video frames by {verify_method} count, but the timeline has "
+                    f"{expected_frames} frames. Export stopped to avoid duplicate or missing frames."
+                )
+                try:
+                    Path(save_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+                return False
             self.set_status(f"Smart exported {len(ranges)} edited range(s)", 5000)
             return True
-        except (OSError, subprocess.CalledProcessError):
+        except (OSError, subprocess.CalledProcessError) as exc:
+            self.last_smart_export_error = str(exc)
             return False
         finally:
             self.retry_file_operation("clear smart export", lambda: shutil.rmtree(SMART_EXPORT_DIR), SMART_EXPORT_DIR, show_error=False)
+
+    def show_smart_export_failed(self):
+        detail = self.last_smart_export_error or "Smart export failed before full export fallback."
+        message = (
+            "Smart export could not finish, so VideoEdit did not fall back to a full raw-frame export.\n\n"
+            f"{detail}"
+        )
+        self.loading_message = ""
+        self.set_status("Smart export failed", 6000)
+        try:
+            messagebox.showerror("Smart Export Failed", message, parent=self.tk_root)
+        except Exception:
+            pass
 
     def export_video(self):
         if not self.frames:
@@ -4350,8 +4896,12 @@ class FrameEditorApp:
                     self.set_status("Copied original video; no frame changes")
                 return
 
-            if self.try_export_video_smart(ffmpeg, save_path):
+            smart_capable = self.can_smart_export_video()
+            if smart_capable and self.try_export_video_smart(ffmpeg, save_path):
                 self.loading_message = ""
+                return
+            if smart_capable:
+                self.show_smart_export_failed()
                 return
 
             if not self.check_export_staging_size(len(self.frame_paths), "full video export"):
@@ -4380,8 +4930,7 @@ class FrameEditorApp:
                         str(EXPORT_TEMP_DIR / "frame_%06d.png"),
                         "-vf",
                         f"scale={width}:{height}",
-                        "-c:v",
-                        "libx264",
+                        *self.get_h264_encoder_args(ffmpeg),
                         "-pix_fmt",
                         "yuv420p",
                         str(temp_video),
@@ -5351,20 +5900,7 @@ class FrameEditorApp:
         return False
 
     def can_write_frame_edits(self, indexes, max_edits=EDITED_FRAME_LIMIT):
-        new_indexes = {index for index in indexes if 0 <= index < len(self.frame_paths) and index not in self.edited_frame_indexes}
-        if len(self.edited_frame_indexes) + len(new_indexes) <= max_edits:
-            return True
-        message = (
-            f"Editing is limited to {max_edits} changed frames at a time.\n\n"
-            f"You already have {len(self.edited_frame_indexes)} edited frames and this would add {len(new_indexes)} more. "
-            "Save/export, reopen, then continue editing."
-        )
-        self.set_status(f"Edit limit reached ({max_edits} frames)", 6000)
-        try:
-            messagebox.showwarning("Edit Limit Reached", message, parent=self.tk_root)
-        except Exception:
-            pass
-        return False
+        return True
 
     def can_write_frame_edit(self, index, max_edits=EDITED_FRAME_LIMIT):
         return self.can_write_frame_edits([index], max_edits)
@@ -8281,10 +8817,13 @@ class FrameEditorApp:
         self.hotkey_popup = popup
         active_capture = {"action": None}
         vars_by_action = {}
+        export_mode_var = StringVar(value=self.export_mode if self.export_mode in EXPORT_MODES else EXPORT_MODE_FAST)
 
         main = Frame(popup, padx=14, pady=12)
         main.pack()
-        Label(main, text="Click a hotkey box, then press the new key combo.").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        Label(main, text="Export Mode").grid(row=0, column=0, sticky="w", pady=(0, 8))
+        OptionMenu(main, export_mode_var, *EXPORT_MODES).grid(row=0, column=1, sticky="ew", padx=(12, 0), pady=(0, 8))
+        Label(main, text="Click a hotkey box, then press the new key combo.").grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
         def begin_capture(action):
             active_capture["action"] = action
@@ -8301,7 +8840,7 @@ class FrameEditorApp:
             active_capture["action"] = None
             return "break"
 
-        for row, action in enumerate(HOTKEY_ORDER, start=1):
+        for row, action in enumerate(HOTKEY_ORDER, start=2):
             Label(main, text=HOTKEY_LABELS.get(action, action)).grid(row=row, column=0, sticky="w", pady=2)
             value = StringVar(value=self.hotkey_label(action))
             vars_by_action[action] = value
@@ -8311,7 +8850,7 @@ class FrameEditorApp:
             entry.bind("<FocusIn>", lambda _event, item=action: begin_capture(item))
 
         buttons = Frame(main)
-        buttons.grid(row=len(HOTKEY_ORDER) + 1, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        buttons.grid(row=len(HOTKEY_ORDER) + 2, column=0, columnspan=2, sticky="e", pady=(12, 0))
 
         def reset_defaults():
             for action in HOTKEY_ORDER:
@@ -8321,8 +8860,9 @@ class FrameEditorApp:
             for action in HOTKEY_ORDER:
                 value = self.normalize_hotkey(vars_by_action[action].get())
                 self.hotkeys[action] = value or DEFAULT_HOTKEYS[action]
+            self.export_mode = export_mode_var.get() if export_mode_var.get() in EXPORT_MODES else EXPORT_MODE_FAST
             try:
-                self.save_hotkeys()
+                self.save_settings()
                 self.set_status("Settings saved")
             except OSError:
                 self.set_status("Could not save settings")
